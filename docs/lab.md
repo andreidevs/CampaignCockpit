@@ -35,7 +35,7 @@
 ## Promote
 Только кнопкой и только из `candidate`: константы переписываются в `agent.py` построчно, `submission.csv` пересобирается без ключа. Коммит — вручную.
 
-Новые эвристики в `agent.py` выключены по умолчанию, при них план совпадает с `submission.csv`: `PILOT_SIZING="adaptive"`, `RANK_BY="lcb"`, `CHANNEL_MU="lcb"` + `UPGRADE_MIN_ROI`, `META_CONTROLLER`, `PILOT_BUDGET_SHARE`. Включает их только версия, прошедшая gate.
+Новые эвристики в `agent.py` выключены по умолчанию, при них план совпадает с `submission.csv`: `RANK_BY="lcb"`, `CHANNEL_MU="lcb"` + `UPGRADE_MIN_ROI`, `META_CONTROLLER`, `PILOT_BUDGET_SHARE`. Включает их только версия, прошедшая gate.
 
 ## Privacy gateway
 `safe_context` → `llm_proxy` → `_parse_llm` в `agent.py`, общий для LLM-эксперта и ремедиации:

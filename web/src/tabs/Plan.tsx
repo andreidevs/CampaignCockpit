@@ -70,7 +70,7 @@ function CampaignCard({ i, c, run, arm }: { i: number; c: Campaign; run: Run; ar
         {[
           ['Аудитория', `${fmt(c.audience)} аб.`],
           ['Ожидаемый прирост', money(c.expected_gain)],
-          ['Затраты', `${money(c.expected_cost)} ₽`],
+          ['Затраты', `${money(c.expected_cost)} ₸`],
           ['Чистый эффект', money(net)],
         ].map(([t, v], j) => (
           <div key={t}>
@@ -138,7 +138,7 @@ function CampaignCard({ i, c, run, arm }: { i: number; c: Campaign; run: Run; ar
               })}
               <p className="text-xs leading-relaxed text-muted">
                 Каналы: все ячейки стартуют с самого дешёвого ({channels[0][0]}), затем жадно апгрейдятся по Δэффект/Δстоимость, пока хватает бюджета
-                ({channels.map(([n, v]) => `${CHANNEL[n]?.label ?? n}: ${v.cost_per_contact} ₽, ×${fmt(v.conversion_multiplier, 2)}`).join('; ')}).
+                ({channels.map(([n, v]) => `${CHANNEL[n]?.label ?? n}: ${v.cost_per_contact} ₸, ×${fmt(v.conversion_multiplier, 2)}`).join('; ')}).
                 Охват заполняется по убыванию ценности на контакт.
               </p>
             </Accordion.Body>

@@ -25,7 +25,7 @@ export default function Pilots({ run, onSave }: { run: Run; onSave: () => Promis
     <>
       <HowTo>
         <b>Пилот</b> — маленькая реальная кампания на 60–200 абонентов, чтобы проверить гипотезу на этой аудитории, а не на истории.
-        Всего {pilots.length} пилотов, {fmt(n)} абонентов, {money(cost)} ₽. Итог: масштабировать — <b>{by('scale')}</b>,
+        Всего {pilots.length} пилотов, {fmt(n)} абонентов, {money(cost)} ₸. Итог: масштабировать — <b>{by('scale')}</b>,
         отложить — <b>{by('hold')}</b>, отказаться — <b>{by('drop')}</b>. Пилоты идут через SMS; результат пересчитан к «базе» (÷ множитель канала),
         чтобы его можно было применить к любому каналу.
       </HowTo>
@@ -47,7 +47,7 @@ export default function Pilots({ run, onSave }: { run: Run; onSave: () => Promis
                     <span className="font-medium">Пилот №{d.i}</span>
                     <Flow from={[`${d.p.cur} · ${d.p.seg}`]} to={d.p.target} />
                     <span>история <Delta v={d.prior} /> → пилот <Delta v={d.observed} /> → итог <Delta v={d.p.post_mu} /></span>
-                    <span className="text-muted">{d.p.n} аб. · {money(d.p.cost)} ₽</span>
+                    <span className="text-muted">{d.p.n} аб. · {money(d.p.cost)} ₸</span>
                   </div>
                 ) : null
               }} />
@@ -77,10 +77,10 @@ export default function Pilots({ run, onSave }: { run: Run; onSave: () => Promis
             { key: 'i', label: '№', render: (p) => p.i, sort: (p) => p.i, num: true },
             { key: 'flow', label: 'Что проверяли', render: (p) => <Flow from={[`${p.cur} · ${p.seg}`]} to={p.target} />, sort: (p) => p.cur + p.seg },
             { key: 'n', label: 'Выборка', render: (p) => `${p.n} аб.`, sort: (p) => p.n, num: true },
-            { key: 'cost', label: 'Стоимость, ₽', render: (p) => fmt(p.cost), sort: (p) => p.cost, num: true },
+            { key: 'cost', label: 'Стоимость, ₸', render: (p) => fmt(p.cost), sort: (p) => p.cost, num: true },
             { key: 'ratio', label: 'Наблюдаемый uplift', num: true, sort: (p) => p.ratio, render: (p) => <Delta v={p.ratio} />,
               hint: 'observed_lift_ratio от среды: относительный прирост ARPU выборки через SMS, с шумом ≈ 0.8/√n' },
-            { key: 'total', label: 'Прирост выборки, ₽', num: true, sort: (p) => p.total, hint: 'observed_lift_total: абсолютный прирост ARPU по выборке пилота',
+            { key: 'total', label: 'Прирост выборки, ₸', num: true, sort: (p) => p.total, hint: 'observed_lift_total: абсолютный прирост ARPU по выборке пилота',
               render: (p) => <span style={{ color: p.total >= 0 ? 'var(--pos)' : 'var(--neg)' }}>{money(p.total)}</span> },
             { key: 'post', label: 'Оценка после', num: true, sort: (p) => p.post_mu ?? 0,
               hint: 'Итоговая оценка гипотезы μ ± σ после всех её пилотов',

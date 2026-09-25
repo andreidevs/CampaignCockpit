@@ -57,7 +57,7 @@ export default function Command({ run }: { run: Run }) {
               ]} />
             </div>
             <div className="flex flex-col gap-1.5">
-              <span className="text-xs font-medium">Бюджет, ₽</span>
+              <span className="text-xs font-medium">Бюджет, ₸</span>
               <StackBar parts={[
                 { label: 'пилоты', value: pilotCost, color: 'var(--series-2)' },
                 { label: 'план', value: planCost, color: 'var(--accent)' },

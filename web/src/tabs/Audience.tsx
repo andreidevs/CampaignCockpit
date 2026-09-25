@@ -91,7 +91,7 @@ export default function Audience({ run }: { run: Run }) {
             { key: 'cur', label: 'Текущий тариф', render: (c) => <span className="num">{c.cur}</span>, sort: (c) => c.cur },
             { key: 'seg', label: 'ARPU-сегмент', render: (c) => c.seg, sort: (c) => SEGS.indexOf(c.seg) },
             { key: 'n', label: 'Абоненты', render: (c) => fmt(c.n), sort: (c) => c.n, num: true },
-            { key: 'arpu', label: 'Средний ARPU, ₽', render: (c) => fmt(c.arpu), sort: (c) => c.arpu, num: true, hint: 'Средний ARPU за 3 месяца' },
+            { key: 'arpu', label: 'Средний ARPU, ₸', render: (c) => fmt(c.arpu), sort: (c) => c.arpu, num: true, hint: 'Средний ARPU за 3 месяца' },
             { key: 'S', label: 'Ценность ячейки', num: true, sort: (c) => c.S,
               hint: 'Σ predicted_arpu по абонентам ячейки: относительный эффект кампании умножается на эту сумму',
               render: (c) => <BarCell value={c.S} max={maxS} label={money(c.S)} color="var(--seq-5)" /> },
