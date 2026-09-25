@@ -23,6 +23,13 @@ import pandas as pd
 NOISE_STD = 0.804   # шум на абонента, опубликован в документации среды
 PRIOR_STD = 0.25    # широкий: в боевой среде эффекты другие, чем в истории
 ARMS_PER_CELL = 4
+PILOT_POLICY = "kg"  # выбор пилота: "kg" (voi/ei ниже); "ts", "ttts", "es" … — см. _policy_*
+SPIKE_J = 0.0        # spike-and-slab: среднее «джекпота» по θ (0 = выключено), см. _spike
+SPIKE_SD = 0.4
+SPIKE_PI = (0.0, 0.01, 0.03, 0.1)  # сетка априорной доли джекпотов
+TTTS_BETA = 0.5
+PANDORA_N = (20, 30, 60, 100, 150, 200)  # сетка размеров пилота для pandora / ttts2 / ids
+RELD_K = 4           # reld: пилотов на проверку надёжности истории до KG
 ARMS_BIG_FRAC = 0.10 # ячейка с долей ARPU ≥ порога получает все переходы из истории (0 = выключено)
 LCB_K = 0.5         # в план: mu - k*sigma > 0; 0 уходит в минус в пессимистичных мирах, 1 слишком робок
 EI_STOP = 0.005     # хватит разведки, когда EI < 0.5% от стартового максимума
@@ -408,7 +415,39 @@ def _joint(arms, fit=True):
         mean, var, _ = post(sa, sb)
     for a, mu, v in zip(A, mean, var):
         a["mu"], a["var"] = float(mu), float(max(v, 1e-8))
+    if SPIKE_J:
+        _spike(A)
     return sa, sb
+
+
+def _spike(A):
+    """
+    Spike-and-slab поверх гауссова апостериора (Johnstone & Silverman 2004, «Needles and straw in haystacks»):
+    θ ~ (1 − π)·гаусс + π·N(SPIKE_J, SPIKE_SD²) — гаусс почти не допускает джекпот 0.8–1.5, и польза пилота на редком
+    переходе занижена. π подбирается по правдоподобию пилотов на сетке (0 — если джекпотов не видно); у рукава с
+    пилотами вес компонент пересчитывается по его наблюдениям, наружу — среднее и дисперсия смеси.
+    """
+    def lik(a, pi):
+        y, r = np.array(a["obs"]), np.array(a["nv"])
+        w = 1 / r; yb, rb = (w * y).sum() / w.sum(), 1 / w.sum()
+        v0 = a["v0a"] + a["v0b"]
+        g = math.exp(-0.5 * (yb - a["m0"]) ** 2 / (v0 + rb)) / math.sqrt(v0 + rb)
+        j = math.exp(-0.5 * (yb - SPIKE_J) ** 2 / (SPIKE_SD ** 2 + rb)) / math.sqrt(SPIKE_SD ** 2 + rb)
+        return (1 - pi) * g, pi * j, yb, rb
+    seen = [a for a in A if a.get("obs")]
+    pi = max(SPIKE_PI, key=lambda p: sum(math.log(sum(lik(a, p)[:2]) + 1e-300) for a in seen)) if seen else SPIKE_PI[len(SPIKE_PI) // 2]
+    for a in A:
+        if pi <= 0:
+            break
+        mg, vg = a["mu"], a["var"]
+        if a.get("obs"):
+            lg, lj, yb, rb = lik(a, pi)
+            w = lj / (lg + lj) if lg + lj > 0 else 0.0
+            vj = 1 / (1 / SPIKE_SD ** 2 + 1 / rb); mj = vj * (SPIKE_J / SPIKE_SD ** 2 + yb / rb)
+        else:
+            w, mj, vj = pi, SPIKE_J, SPIKE_SD ** 2
+        mu = (1 - w) * mg + w * mj
+        a["mu"], a["var"] = mu, max((1 - w) * (vg + mg ** 2) + w * (vj + mj ** 2) - mu ** 2, 1e-8)
 
 
 def _ei(mu, sd, best):
@@ -667,6 +706,247 @@ class Agent:
         """Апостериор по ходу разведки: bma — усреднение по сетке масштабов; ml — масштаб 1 или подбор после каждого пилота."""
         return _joint(arms, fit=SCALE_MODE == "bma" or SCALE_AT == "each")
 
+    # --- альтернативные политики выбора пилота (PILOT_POLICY) -----------------------------------------------
+    def _rng(self, env):
+        """Детерминированный генератор: план воспроизводим (submission.csv), но выборки разные на каждом шаге."""
+        return np.random.default_rng(1000 + 37 * env.pilots_left)
+
+    def _cell_groups(self, arms):
+        g = {}
+        for k in arms:
+            g.setdefault(k[:2], []).append(k)
+        return g
+
+    def _port(self, env, cells, arms, draws=300):
+        """
+        Портфельный оракул для политик на выборках (Wang & Chen 2018): θ ~ апостериор, в каждой ячейке лучший рукав
+        по ценности max_ch(θ·mult·S − cost·n), ячейки — жадно по ценности на контакт до остатка охвата.
+        Возвращает ключи, выборки θ, ценности V и принадлежность к оптимальному плану (draws × рукава).
+        """
+        rng = self._rng(env)
+        keys = list(arms)
+        mu = np.array([arms[k]["mu"] for k in keys]); sd = np.sqrt([arms[k]["var"] for k in keys])
+        S = np.array([cells[k[:2]]["S"] for k in keys]); n = np.array([cells[k[:2]]["n"] for k in keys])
+        th = rng.normal(mu, sd, size=(draws, len(keys)))
+        V = np.max([th * c["conversion_multiplier"] * S - c["cost_per_contact"] * n for c in env.channels.values()], axis=0)
+        groups = self._cell_groups(arms); pos = {k: i for i, k in enumerate(keys)}
+        cl = list(groups); nc = np.array([cells[c]["n"] for c in cl])
+        bv = np.zeros((draws, len(cl))); ba = np.zeros((draws, len(cl)), dtype=int)
+        for j, c in enumerate(cl):
+            ix = np.array([pos[k] for k in groups[c]])
+            sub = V[:, ix]; arg = sub.argmax(1)
+            bv[:, j], ba[:, j] = sub[np.arange(draws), arg], ix[arg]
+        order = np.argsort(-bv / nc, axis=1)
+        take = (np.cumsum(nc[order], axis=1) <= env.remaining_contacts) & (np.take_along_axis(bv, order, 1) > 0)
+        member = np.zeros((draws, len(keys)), dtype=bool)
+        rows = np.repeat(np.arange(draws), len(cl)).reshape(draws, len(cl))
+        member[rows[take], np.take_along_axis(ba, order, 1)[take]] = True
+        return keys, th, V, member
+
+    def _voi_parts(self, env, cells, arms, mult, cost, k, n):
+        """KG(n) и цена пилота на n — те же формулы, что в _arm_net_voi."""
+        a, c = arms[k], cells[k[:2]]
+        s = a["var"] / math.sqrt(a["var"] + (NOISE_STD / mult) ** 2 / n)
+        kg = c["S"] * mult * _ei(-abs(a["mu"] - self._best_other(arms, k)), s, 0.0)
+        gain = mult * max(a["mu"], 0.0) * c["S"] / c["n"]
+        return kg, n * (cost + self._v_marg - gain)
+
+    def _policy_kgla(self, env, cells, arms, mult, cost):
+        """KG(*) с просмотром на k ≤ 3 пилота (Frazier & Powell 2010): max_k [KG(k·n) − k·цена]/k — S-образная ценность."""
+        self._v_marg = mult * self._marginal_value(cells, arms, env.remaining_contacts)
+        out = {}
+        for k in arms:
+            n = self._pilot_size(cells, arms, k)
+            v = max((self._voi_parts(env, cells, arms, mult, cost, k, j * n)[0] - j * self._voi_parts(env, cells, arms, mult, cost, k, n)[1]) / j
+                    for j in range(1, min(3, env.pilots_left) + 1))
+            if v > 0:
+                out[k] = v
+        return out
+
+    def _policy_pandora(self, env, cells, arms, mult, cost):
+        """
+        Индекс Вейцмана (1979, «Optimal search for the best alternative»): резервная ценность z из
+        E[(X − z)⁺] = цена пилота, X ~ N(μ·W, (s̃·W)²); пилот — max z − порог ячейки; стоп, если все ниже порога.
+        """
+        self._v_marg = mult * self._marginal_value(cells, arms, env.remaining_contacts)
+        out = {}
+        for k, a in arms.items():
+            c = cells[k[:2]]; W = mult * c["S"]; tau = max(self._best_other(arms, k), 0.0) * W
+            best = None
+            for n in PANDORA_N:
+                if n > c["n"]:
+                    continue
+                s = a["var"] / math.sqrt(a["var"] + (NOISE_STD / mult) ** 2 / n) * W
+                o = self._voi_parts(env, cells, arms, mult, cost, k, n)[1]
+                if s <= 0:
+                    continue
+                lo, hi = a["mu"] * W - 10 * s, a["mu"] * W + 10 * s  # s·f((μ−z)/s) убывает по z — бисекция
+                for _ in range(60):
+                    z = (lo + hi) / 2
+                    lo, hi = (z, hi) if s * _ei((a["mu"] * W - z) / s, 1.0, 0.0) > o else (lo, z)
+                if best is None or z > best[0]:
+                    best = (z, n)
+            if best and best[0] > tau:
+                out[k], self._pol_n[k] = best[0] - tau, best[1]
+        return out
+
+    def _policy_reld(self, env, cells, arms, mult, cost):
+        """
+        Дизайн на надёжность истории (Chaloner & Verdinelli 1995): первые RELD_K пилотов — D-оптимально для (β0, β1)
+        среди крупных рукавов (max xᵀM⁻¹x, x = (1, μ_истории)), дальше — KG (voi) с его правилом остановки.
+        """
+        done = [k for k, a in arms.items() if a.get("obs")]
+        if sum(len(arms[k]["obs"]) for k in done) >= RELD_K:
+            sc = self._arm_net_voi(env, cells, arms, mult, cost)
+            return {k: v for k, v in sc.items() if v > 0}
+        noise = (NOISE_STD / mult) ** 2 / PILOT_MAX
+        M = np.diag([1 / B0 ** 2, 1 / B1 ** 2])
+        for k in done:
+            x = np.array([1.0, arms[k]["m0"]])
+            M += len(arms[k]["obs"]) * np.outer(x, x) / (arms[k]["v0a"] + arms[k]["v0b"] + noise)
+        Mi = np.linalg.inv(M)
+        cand = sorted((k for k in arms if not arms[k]["n"]), key=lambda k: -cells[k[:2]]["S"])
+        cand = cand[:max(1, int(0.3 * len(cand)))]
+        out = {}
+        for k in cand:
+            x = np.array([1.0, arms[k]["m0"]])
+            out[k] = float(x @ Mi @ x) / (arms[k]["v0a"] + arms[k]["v0b"] + noise)
+            self._pol_n[k] = min(PILOT_MAX, cells[k[:2]]["n"])
+        return out
+
+    def _policy_es2(self, env, cells, arms, mult, cost):
+        """Exploration sampling по вхождению в план (Kasy & Sautmann 2021): ∝ p(1−p)·E[V | в плане], p = P(рукав ∈ A*)."""
+        keys, th, V, member = self._port(env, cells, arms)
+        p = member.mean(0)
+        vin = np.where(member.any(0), (V * member).sum(0) / np.maximum(member.sum(0), 1), 0.0)
+        q = p * (1 - p) * np.maximum(vin, 0)
+        if q.sum() <= 0:
+            return {}
+        return {keys[int(self._rng(env).choice(len(keys), p=q / q.sum()))]: 1.0}
+
+    def _policy_ttts2(self, env, cells, arms, mult, cost):
+        """
+        Top-two TS с портфельным оракулом (Russo 2016; Jourdan et al. 2022): план-лидер по выборке 1, претендент —
+        первая выборка с другим планом; с вероятностью TTTS_BETA кандидаты — план-лидер, иначе их разность;
+        пилот — max var·W²; размер — наименьший n, при котором 2σ_n ≤ |θ¹ − θ²|.
+        """
+        keys, th, V, member = self._port(env, cells, arms, draws=100)
+        rng = self._rng(env)
+        diff = np.where((member != member[0]).any(1))[0]
+        j = diff[0] if len(diff) else 1
+        cand = member[0] if rng.random() < TTTS_BETA or not len(diff) else member[0] ^ member[j]
+        if not cand.any():
+            cand = np.ones(len(keys), dtype=bool)
+        W = np.array([mult * cells[k[:2]]["S"] for k in keys]); var = np.array([arms[k]["var"] for k in keys])
+        i = int(np.argmax(np.where(cand, var * W ** 2, -1)))
+        gap = abs(th[0, i] - th[j, i])
+        n = next((m for m in PANDORA_N if 2 * NOISE_STD / mult / math.sqrt(m) <= gap), PILOT_MAX)
+        self._pol_n[keys[i]] = min(n, cells[keys[i][:2]]["n"])
+        return {keys[i]: 1.0}
+
+    def _policy_ids(self, env, cells, arms, mult, cost):
+        """
+        Information-directed sampling (Russo & Van Roy 2014), вариант с дисперсией: min по (рукав, n) цена² / g,
+        g = p(1−p)·(θ̄_в − θ̄_вне)²·W²·v/(v + σ_n²) — сколько пилот скажет о составе оптимального плана.
+        """
+        keys, th, V, member = self._port(env, cells, arms)
+        self._v_marg = mult * self._marginal_value(cells, arms, env.remaining_contacts)
+        p = member.mean(0); cnt = member.sum(0)
+        tin = np.where(cnt > 0, (th * member).sum(0) / np.maximum(cnt, 1), 0)
+        tout = np.where(cnt < len(th), (th * ~member).sum(0) / np.maximum(len(th) - cnt, 1), 0)
+        out = {}
+        for i, k in enumerate(keys):
+            a, c = arms[k], cells[k[:2]]; W = mult * c["S"]
+            base = p[i] * (1 - p[i]) * (tin[i] - tout[i]) ** 2 * W ** 2
+            if base <= 0:
+                continue
+            best = None
+            for n in PANDORA_N:
+                if n > c["n"]:
+                    continue
+                g = base * a["var"] / (a["var"] + (NOISE_STD / mult) ** 2 / n)
+                o = max(self._voi_parts(env, cells, arms, mult, cost, k, n)[1], 1.0)
+                sc = -o * o / g
+                if best is None or sc > best[0]:
+                    best = (sc, n)
+            if best:
+                out[k], self._pol_n[k] = best
+        return out
+
+    def _policy_seqh(self, env, cells, arms, mult, cost):
+        """
+        Distilled sensing / sequential halving (Haupt, Castro & Nowak 2011; Karnin et al. 2013): много дешёвых проверок,
+        затем доуточнение выживших. Стадии по номеру пилота: 1–10 — n=30 по P(θ > альтернатива)·S среди
+        непроверенных; 11–15 — n=80 среди проверенных с P > 0.3; дальше — n=200 на лучших.
+        """
+        done = 20 - env.pilots_left
+        stage, n = (1, 30) if done < 10 else (2, 80) if done < 15 else (3, 200)
+        out = {}
+        for k, a in arms.items():
+            pr = 0.5 * (1 + math.erf((a["mu"] - max(self._best_other(arms, k), 0.0)) / math.sqrt(2 * a["var"])))
+            if (stage == 1 and a["n"]) or (stage > 1 and (not a["n"] or pr < 0.3)):
+                continue
+            out[k] = pr * cells[k[:2]]["S"]
+            self._pol_n[k] = min(n, cells[k[:2]]["n"])
+        return out or {k: 1.0 for k in list(arms)[:1]}
+
+    def _policy_ts(self, env, cells, arms, mult, cost):
+        """
+        Thompson sampling с портфельным оракулом: одна выборка θ̃ ~ апостериор; в каждой ячейке — лучший рукав по θ̃;
+        пилот — в ячейке с наибольшим выигрышем выборки над текущим решением (лучший μ), S·(θ̃_best⁺ − θ̃_current⁺).
+        """
+        rng = self._rng(env)
+        th = {k: rng.normal(a["mu"], math.sqrt(a["var"])) for k, a in arms.items()}
+        out = {}
+        for c, ks in self._cell_groups(arms).items():
+            b = max(ks, key=th.get)
+            cur = max(ks, key=lambda k: arms[k]["mu"])
+            out[b] = cells[c]["S"] * (max(th[b], 0.0) - (max(th[cur], 0.0) if arms[cur]["mu"] > 0 else 0.0)) + 1e-9
+        return out
+
+    def _policy_ttts(self, env, cells, arms, mult, cost):
+        """
+        Top-two Thompson sampling (Russo 2016, «Simple Bayesian algorithms for best-arm identification»): ячейка — по
+        выигрышу выборки, как в ts; в ней с вероятностью TTTS_BETA лидер выборки, иначе претендент — лучший рукав
+        повторной выборки, отличный от лидера (до 50 попыток).
+        """
+        rng = self._rng(env)
+        th = {k: rng.normal(a["mu"], math.sqrt(a["var"])) for k, a in arms.items()}
+        best = None
+        for c, ks in self._cell_groups(arms).items():
+            b = max(ks, key=th.get)
+            cur = max(ks, key=lambda k: arms[k]["mu"])
+            v = cells[c]["S"] * (max(th[b], 0.0) - (max(th[cur], 0.0) if arms[cur]["mu"] > 0 else 0.0))
+            if best is None or v > best[0]:
+                best = (v, c, b, ks)
+        _, c, lead, ks = best
+        pick = lead
+        if len(ks) > 1 and rng.random() > TTTS_BETA:
+            for _ in range(50):
+                ch = max(ks, key=lambda k: rng.normal(arms[k]["mu"], math.sqrt(arms[k]["var"])))
+                if ch != lead:
+                    pick = ch
+                    break
+        return {pick: 1.0}
+
+    def _policy_es(self, env, cells, arms, mult, cost):
+        """
+        Exploration sampling (Kasy & Sautmann 2021, Econometrica): p_k — апостериорная вероятность, что рукав лучший в
+        ячейке и выгоден (Монте-Карло); пилот случайно ∝ S_c·p_k·(1−p_k) — туда, где решение по ячейке ещё не ясно.
+        """
+        rng = self._rng(env)
+        score = {}
+        for c, ks in self._cell_groups(arms).items():
+            mu = np.array([arms[k]["mu"] for k in ks]); sd = np.sqrt([arms[k]["var"] for k in ks])
+            th = rng.normal(mu, sd, size=(400, len(ks)))
+            win = np.bincount(np.argmax(np.c_[th, np.zeros(400)], 1), minlength=len(ks) + 1)[:len(ks)] / 400
+            for k, p in zip(ks, win):
+                score[k] = cells[c]["S"] * p * (1 - p)
+        keys = list(score); w = np.array([score[k] for k in keys])
+        if w.sum() <= 0:
+            return {keys[0]: 1.0}
+        return {keys[int(rng.choice(len(keys), p=w / w.sum()))]: 1.0}
+
     def _explore(self, env, cells, arms):
         mult = env.channels[PILOT_CH]["conversion_multiplier"]
         cost = env.channels[PILOT_CH]["cost_per_contact"]
@@ -681,8 +961,22 @@ class Agent:
             if self.exploit and ADAPT_MODE == "stop":
                 self.log.append("explore stopped: история надёжна")
                 break
-            ei = self._arm_net_voi(env, cells, arms, mult, cost) if voi else self._arm_ei(cells, arms)
-            if self.exploit:  # история надёжна: пилот = маленькая кампания на лучшем кандидате плана, польза = μ·Σ ARPU
+            policy = PILOT_POLICY != "kg" and not self.exploit
+            self._pol_n = {}
+            if policy:  # альтернативная политика (см. _policy_*): балл и, возможно, размер; пустой ответ = стоп
+                ei = getattr(self, f"_policy_{PILOT_POLICY}")(env, cells, arms, mult, cost)
+                if not ei:
+                    self.log.append(f"explore stopped: {PILOT_POLICY}")
+                    break
+            else:
+                ei = self._arm_net_voi(env, cells, arms, mult, cost) if voi else self._arm_ei(cells, arms)
+            if self.exploit and ADAPT_MODE not in ("exploit", "stop"):
+                # история надёжна: дальше — политика, сильная при верной истории (ids / pandora), вместо «лучших кандидатов»
+                self._pol_n = {}
+                ei = getattr(self, f"_policy_{ADAPT_MODE}")(env, cells, arms, mult, cost)
+                if not ei:
+                    break
+            elif self.exploit:  # история надёжна: пилот = маленькая кампания на лучшем кандидате плана, польза = μ·Σ ARPU
                 ei = {k: arms[k]["mu"] * cells[k[:2]]["S"] for k in ei if arms[k]["mu"] > 0 and self._eligible(arms[k], k)}
                 if not ei:
                     break
@@ -694,10 +988,10 @@ class Agent:
                     break
             k = max(ei, key=ei.get)
             ei0 = ei0 or ei[k]
-            if not self.exploit and ((ei[k] <= 0) if voi else (ei[k] < EI_STOP * ei0)):
+            if not self.exploit and not policy and ((ei[k] <= 0) if voi else (ei[k] < EI_STOP * ei0)):
                 break
             cur, seg, target = k
-            n = min(PILOT_MAX, cells[k[:2]]["n"]) if self.exploit else self._pilot_size(cells, arms, k)
+            n = self._pol_n.get(k) or (min(PILOT_MAX, cells[k[:2]]["n"]) if self.exploit else self._pilot_size(cells, arms, k))
             # политика: не больше PILOT_BUDGET_SHARE бюджета и PILOT_CONTACT_SHARE охвата на пилоты
             n = min(n, int((PILOT_BUDGET_SHARE * total - (total - env.remaining_budget)) / cost) if cost else n)
             n = min(n, int(PILOT_CONTACT_SHARE * reach - (reach - env.remaining_contacts)))
