@@ -23,10 +23,6 @@ import pandas as pd
 NOISE_STD = 0.804   # шум на абонента, опубликован в документации среды
 PRIOR_STD = 0.25    # широкий: в боевой среде эффекты другие, чем в истории
 ARMS_PER_CELL = 4
-TAIL_K = 1.0         # voi: множитель на sd сдвига от пилота (тяжёлый хвост эффектов); 1 = гаусс
-TAIL_UNRELIABLE = 1.0 # ADAPT: TAIL_K для всех ячеек, если после ADAPT_AFTER пилотов история признана ненадёжной
-TAIL_BIG_ONLY = True # TAIL_K только в крупных ячейках (≥ ARMS_BIG_FRAC)
-SEED_BIG = 0         # пилотов полного размера в каждую крупную ячейку до основной разведки (0 = выключено)
 ARMS_BIG_FRAC = 0.10 # ячейка с долей ARPU ≥ порога получает все переходы из истории (0 = выключено)
 LCB_K = 0.5         # в план: mu - k*sigma > 0; 0 уходит в минус в пессимистичных мирах, 1 слишком робок
 EI_STOP = 0.005     # хватит разведки, когда EI < 0.5% от стартового максимума
@@ -56,31 +52,22 @@ PILOT_BUDGET_SHARE = 1.0    # доля бюджета, которую можно
 PILOT_CONTACT_SHARE = 1.0   # доля охвата, которую можно потратить на пилоты
 PILOT_VALUE = "voi"         # "ei": expected improvement; "voi": knowledge gradient − цена пилота (с учётом выгоды самого пилота)
 LCB_K_PILOT = 0.5           # k для рукавов после пилота (у непилотированных остаётся LCB_K)
-LCB_K_HIGH = 0.5            # k для HIGH-ячеек в план; 1.0 не прошёл gate: худший keep=0 хуже (docs/experiments.md)
 PRIOR_SD = "share"          # "flat": PRIOR_STD всем; "share": sd рукава = √(SD0² + (SD_SHARE·доля перехода)²) вместо PRIOR_STD
 SD0 = 0.03
 SD_SHARE = 1.0
 JOINT = True                # совместный апостериор с калибровкой θ = β0 + β1·m0 (см. _joint)
 B0, B1 = 0.03, 0.5          # sd общего сдвига и наклона доверия к истории
-CORR_KG = False             # voi: KG с корреляциями — пилот сдвигает все рукава через общие коэффициенты
-TARGET_SD = 0.0             # sd общего эффекта целевого тарифа в совместной модели (0 = выключено)
-SEG_SD = 0.0                # sd общего эффекта ARPU-сегмента
-B2 = 0.0                    # sd общего сдвига Δ% ARPU (эффект сдвигается на Δ·доля перехода); 0 = выключено
 SCALE_AT = "end"            # "each": после каждого пилота (сужает prior рано — хуже keep0.5/keep0c); "end": масштаб подбирается один раз перед планом, разведка идёт с широким prior
 SCALE_MODE = "bma"          # "ml": одна лучшая точка сетки (ошибается, когда пилоты только на частых переходах); "bma": не одна точка сетки масштабов, а усреднение по всей сетке с весами правдоподобия
-FLAT_PRIOR = 0.0            # bma: доля априорного веса на плоских точках сетки (0 = равный вес всем 25 точкам)
-SCALE_EXPLORE = "none"      # "widen": после каждого пилота масштаб prior подбирается только ≥ 1 — сюрпризы расширяют prior всех рукавов
 SCALE_MIN_OBS = 3           # с какого числа пилотов подбирать масштаб prior по правдоподобию
 SCALE_GRID_A = (0.5, 1.0, 2.0, 4.0, 8.0)
 SCALE_GRID_B = (0.25, 0.5, 1.0, 1.5, 2.0)
 PLANNER = "milp"            # "greedy": прежний жадный план; "milp": точный отбор ячеек/target/каналов под все лимиты (scipy), при сбое — greedy
 MILP_TIME = 20              # с на решатель
-PUSH_K = 0.0                # push без LCB: μ − PUSH_K·σ > 0 (0 = просто ожидание > 0)
 PUSH_FILL = True            # milp: ячейки с μ > 0, но LCB ≤ 0 могут идти в план бесплатным каналом
 ADAPT = True                # JOINT: после ADAPT_AFTER пилотов проверить, надёжна ли история, и сменить режим пилотов
 ADAPT_AFTER = 8
 ADAPT_MODE = "exploit"      # "exploit": оставшиеся пилоты — полного размера на лучших кандидатах плана; "stop": разведка заканчивается
-PILOT_POS_ONLY = False      # пилоты только на μ > 0: risk на моке 0%, но keep=0 −20% — не прошёл gate (docs/experiments.md)
 LLM_GATE = 1.0              # LLM-рукав только в ячейках, где лучший prior mu < порога; 1.0 = всегда (prior < 0.35)
 RANK_BY = "mu"              # "lcb": target в ячейке и очередь охвата по mu - LCB_K*sigma
 CHANNEL_MU = "mu"           # "lcb": апгрейд канала по консервативной оценке — дорогой канал слабым ячейкам не достаётся
@@ -367,7 +354,7 @@ def _update(a, obs, n, mult):
     return obs
 
 
-def _joint(arms, fit=True, grid_a=None, grid_b=None):
+def _joint(arms, fit=True):
     """
     Совместный апостериор всех рукавов (JOINT): θ_k = β0 + β1·m0_k + u_k, β ~ N([0, 1], diag(B0², B1²)),
     u_k ~ N(0, a²·v0a_k + b²·v0b_k). Пилот любого рукава сдвигает β, а через него — все рукава: если история
@@ -381,16 +368,8 @@ def _joint(arms, fit=True, grid_a=None, grid_b=None):
     J = np.array([i for i, a in enumerate(A) for _ in a.get("obs", ())], dtype=int)
     y = np.array([o for a in A for o in a.get("obs", ())])
     r = np.array([v for a in A for v in a.get("nv", ())])
-    sh = np.array([a.get("sh", 0.0) for a in A])
-    X = np.c_[np.ones(len(A)), m, sh]  # β2·доля: общий сдвиг Δ% ARPU для всех переходов даёт сдвиг эффекта ∝ конверсии
-    sd2 = [B0 ** 2, B1 ** 2, B2 ** 2]
-    # общие эффекты целевого тарифа и ARPU-сегмента: пилот «X → t» подсказывает про «Y → t» (история ошибается системно)
-    for pos, sdv in ((2, TARGET_SD), (1, SEG_SD)):
-        if sdv:
-            levels = sorted({k[pos] for k in keys})
-            X = np.c_[X, np.array([[float(k[pos] == lv) for lv in levels] for k in keys])]
-            sd2 += [sdv ** 2] * len(levels)
-    Sb = np.diag(sd2)
+    X = np.c_[np.ones(len(A)), m]
+    Sb = np.diag([B0 ** 2, B1 ** 2])
     XS = X @ Sb
     same = (J[:, None] == J[None, :]) if len(J) else None
 
@@ -412,15 +391,12 @@ def _joint(arms, fit=True, grid_a=None, grid_b=None):
             ll = -0.5 * (d @ np.linalg.solve(S, d) + np.linalg.slogdet(S)[1])
         return mean, var, ll
 
-    grid = [(ga, gb) for ga in grid_a or SCALE_GRID_A for gb in ((grid_b or SCALE_GRID_B) if vb.any() else (1.0,))]
+    grid = [(ga, gb) for ga in SCALE_GRID_A for gb in (SCALE_GRID_B if vb.any() else (1.0,))]
     if fit and SCALE_MODE == "bma":
         # байесовское усреднение по сетке масштабов (равный prior): пока пилотов мало, вариант «эффект не зависит
         # от доли перехода» сохраняет вес, и редкие переходы получают честную неопределённость, а не почти нулевую
         res = [post(ga, gb) for ga, gb in grid]
-        # априорный вес точки сетки: FLAT_PRIOR — доля веса на «плоских» точках (постоянная часть ≥ 4×, эффект не от доли)
-        flat = np.array([ga >= 4 for ga, gb in grid])
-        prior = np.where(flat, FLAT_PRIOR / max(flat.sum(), 1), (1 - FLAT_PRIOR) / max((~flat).sum(), 1)) if FLAT_PRIOR else np.ones(len(grid))
-        lls = np.array([r[2] for r in res]) + np.log(prior)
+        lls = np.array([r[2] for r in res])
         w = np.exp(lls - lls.max()); w /= w.sum()
         mean = sum(wi * r[0] for wi, r in zip(w, res)) if len(J) else m.copy()  # без пилотов μ = история, без шума float
         var = sum(wi * (r[1] + r[0] ** 2) for wi, r in zip(w, res)) - mean ** 2
@@ -435,24 +411,6 @@ def _joint(arms, fit=True, grid_a=None, grid_b=None):
     return sa, sb
 
 
-def _post_cov(arms, sa, sb):
-    """Полная апостериорная ковариация рукавов совместной модели при масштабе (sa, sb): для KG с корреляциями."""
-    keys = list(arms)
-    A = [arms[k] for k in keys]
-    m = np.array([a["m0"] for a in A])
-    va, vb = np.array([a["v0a"] for a in A]), np.array([a["v0b"] for a in A])
-    sh = np.array([a.get("sh", 0.0) for a in A])
-    X = np.c_[np.ones(len(A)), m, sh]
-    Sb = np.diag([B0 ** 2, B1 ** 2, B2 ** 2])
-    C = X @ Sb @ X.T + np.diag(sa ** 2 * va + sb ** 2 * vb)
-    J = np.array([i for i, a in enumerate(A) for _ in a.get("obs", ())], dtype=int)
-    if len(J):
-        r = np.array([v for a in A for v in a.get("nv", ())])
-        S = C[np.ix_(J, J)] + np.diag(r)
-        C = C - C[:, J] @ np.linalg.solve(S, C[J, :])
-    return keys, C
-
-
 def _ei(mu, sd, best):
     z = (mu - best) / sd
     return sd * (z * 0.5 * (1 + math.erf(z / math.sqrt(2))) + math.exp(-z * z / 2) / math.sqrt(2 * math.pi))
@@ -464,7 +422,6 @@ def _lcb(a):
 
 class Agent:
     deadline = math.inf  # ставится в act; внутренние методы, вызванные напрямую (stress_eval), без лимита
-    unreliable = False   # ADAPT: история признана ненадёжной — включается TAIL_UNRELIABLE
     exploit = False      # ADAPT: история признана надёжной, пилоты — на лучших кандидатах плана
     model = None  # slug модели для LLM-эксперта; None → LLM_MODEL / OPENAI_MODEL из env
     # база знаний: прошлые пилоты и итоги кампаний на этой аудитории, dict(cur, seg, target, channel, n, lift_ratio).
@@ -476,7 +433,7 @@ class Agent:
 
     def act(self, env):
         self.log, self.llm_audit, self.weights, self.share = [], [], {}, {}
-        self.exploit = self.unreliable = False
+        self.exploit = False
         self.deadline = time.time() + TIME_LIMIT
         arms = {}
         try:
@@ -526,8 +483,7 @@ class Agent:
         for k in dict.fromkeys(k for pr in props.values() for k in pr):  # порядок важен: ничьи в EI
             src = {n for n, pr in props.items() if k in pr}
             mu = props["prior"][k] if "prior" in src else float(np.mean([props[n][k] for n in src]))
-            arms[k] = {"mu": mu, "var": self._var0(k), "n": 0, "src": src, "obs": [], "m0": mu, "sh": self.share.get(k, 0.0),
-                       **self._v0parts(k)}
+            arms[k] = {"mu": mu, "var": self._var0(k), "n": 0, "src": src, "obs": [], "m0": mu, **self._v0parts(k)}
         self._apply_feedback(env, cells, arms)
         return cells, arms
 
@@ -698,91 +654,18 @@ class Agent:
         Цена: SMS + вытесненные из плана контакты − выигрыш самого пилота (он тоже скорится).
         """
         v_marg = mult * self._marginal_value(cells, arms, env.remaining_contacts)
-        total = sum(c["S"] for c in cells.values())
-        if CORR_KG and JOINT:
-            return self._arm_net_ckg(env, cells, arms, mult, cost, v_marg)
         out = {}
         for k, a in arms.items():
             c, n = cells[k[:2]], self._pilot_size(cells, arms, k)
             s = a["var"] / math.sqrt(a["var"] + (NOISE_STD / mult) ** 2 / n)
-            # TAIL_K: эффекты с тяжёлым хвостом — гаусс недооценивает шанс джекпота; поправка на сдвиг от пилота
-            tail = TAIL_K if TAIL_K != 1.0 else (TAIL_UNRELIABLE if self.unreliable else 1.0)
-            if tail != 1.0 and (not TAIL_BIG_ONLY or TAIL_K == 1.0 or c["S"] >= ARMS_BIG_FRAC * total):
-                s *= tail
             kg = c["S"] * mult * _ei(-abs(a["mu"] - self._best_other(arms, k)), s, 0.0)
-            out[k] = kg - n * (cost + v_marg - mult * max(a["mu"], 0.0) * c["S"] / c["n"])
-        return out
-
-    def _arm_net_ckg(self, env, cells, arms, mult, cost, v_marg):
-        """
-        Knowledge gradient с корреляциями: пилот на рукав k сдвигает μ всех рукавов (через общие β и масштаб),
-        польза = E[V(μ + Δμ)] − V(μ), V = Σ ячеек S·mult·max(0, лучший μ в ячейке). Ожидание — по узлам Гаусса-Эрмита.
-        Цена — как в voi: SMS + вытесненные контакты − выгода самого пилота.
-        """
-        sa, sb = getattr(self, "scale", (1.0, 1.0)) or (1.0, 1.0)
-        keys, C = _post_cov(arms, sa, sb)
-        mu = np.array([arms[k]["mu"] for k in keys])
-        cell_of = [k[:2] for k in keys]
-        cids = {c: i for i, c in enumerate(dict.fromkeys(cell_of))}
-        ci = np.array([cids[c] for c in cell_of])
-        Sv = np.array([cells[c]["S"] for c in cids]) * mult
-        def V(M):  # M: (узлы, рукава) → ценность плана по каждому узлу
-            best = np.full((M.shape[0], len(cids)), 0.0)
-            for j in range(M.shape[1]):
-                best[:, ci[j]] = np.maximum(best[:, ci[j]], M[:, j])
-            return best @ Sv
-        z, w = np.polynomial.hermite_e.hermegauss(9)
-        w = w / w.sum()
-        v0 = V(mu[None, :])[0]
-        out = {}
-        for i, k in enumerate(keys):
-            a, c = arms[k], cells[k[:2]]
-            n = self._pilot_size(cells, arms, k)
-            vy = C[i, i] + (NOISE_STD / mult) ** 2 / n
-            if vy <= 0:
-                continue
-            b = C[:, i] / math.sqrt(vy)
-            kg = float(w @ V(mu[None, :] + z[:, None] * b[None, :])) - v0
             out[k] = kg - n * (cost + v_marg - mult * max(a["mu"], 0.0) * c["S"] / c["n"])
         return out
 
     @staticmethod
     def _refit(arms):
-        """Апостериор по ходу разведки: SCALE_EXPLORE="widen" — масштаб prior только ≥ 1 (сюрпризы расширяют prior)."""
-        if SCALE_MODE == "bma":
-            return _joint(arms)
-        if SCALE_EXPLORE == "widen" and SCALE_AT != "each":
-            return _joint(arms, grid_a=tuple(g for g in SCALE_GRID_A if g >= 1), grid_b=tuple(g for g in SCALE_GRID_B if g >= 1))
-        return _joint(arms, fit=SCALE_AT == "each")
-
-    def _seed_big(self, env, cells, arms, mult, cost):
-        """
-        SEED_BIG пилотов полного размера в каждую крупную ячейку (≥ ARMS_BIG_FRAC ARPU) до основной разведки: там ценность
-        находки максимальна, а KG по всем ячейкам сразу размазывает пилоты. Рукав — максимум EI внутри ячейки.
-        """
-        total = sum(c["S"] for c in cells.values())
-        big = sorted((k for k, c in cells.items() if c["S"] >= ARMS_BIG_FRAC * total), key=lambda k: -cells[k]["S"])
-        for cell in big:
-            for _ in range(SEED_BIG):
-                if env.pilots_left <= 0 or time.time() > self.deadline:
-                    return
-                cand = {k: _ei(a["mu"], math.sqrt(a["var"]), self._best_other(arms, k)) for k, a in arms.items()
-                        if k[:2] == cell and not a["n"]}
-                if not cand:
-                    break
-                k = max(cand, key=cand.get)
-                n = min(PILOT_MAX, cells[cell]["n"], env.remaining_contacts)
-                if n < 10 or env.remaining_budget - n * cost < cost * (env.remaining_contacts - n):
-                    return
-                try:
-                    res = env.run_pilot(target_tariff=k[2], channel=PILOT_CH, n_customers=n,
-                                        filter_arpu_segment=k[1], filter_current_tariff=k[0])
-                except (RuntimeError, ValueError):
-                    return
-                obs = _update(arms[k], res["observed_lift_ratio"] / mult, res["n_customers"], mult)
-                if JOINT:
-                    self.scale = self._refit(arms)
-                self.log.append(f"pilot {k[0]}/{k[1]}->{k[2]} n={res['n_customers']} obs={obs:.3f} (крупная ячейка)")
+        """Апостериор по ходу разведки: bma — усреднение по сетке масштабов; ml — масштаб 1 или подбор после каждого пилота."""
+        return _joint(arms, fit=SCALE_MODE == "bma" or SCALE_AT == "each")
 
     def _explore(self, env, cells, arms):
         mult = env.channels[PILOT_CH]["conversion_multiplier"]
@@ -790,8 +673,6 @@ class Agent:
         ei0, llm_hits = None, []
         total = getattr(env, "total_budget", env.remaining_budget)
         reach = getattr(env, "max_total_contacts", env.remaining_contacts)
-        if SEED_BIG and ARMS_BIG_FRAC:
-            self._seed_big(env, cells, arms, mult, cost)
         while env.pilots_left > 0:
             if time.time() > self.deadline:
                 self.log.append("explore stopped: time limit")
@@ -809,10 +690,6 @@ class Agent:
             if PILOT_SIZING == "adaptive":  # stop по posterior confidence: уверенный рукав не перепроверяем
                 ei = {k: v for k, v in ei.items() if not arms[k]["n"]
                       or abs(arms[k]["mu"] - self._best_other(arms, k)) / math.sqrt(arms[k]["var"]) <= 2}
-                if not ei:
-                    break
-            if PILOT_POS_ONLY:  # пилот на рукав с μ ≤ 0 — его абоненты почти наверняка уходят в минус (risk score)
-                ei = {k: v for k, v in ei.items() if arms[k]["mu"] > 0}
                 if not ei:
                     break
             k = max(ei, key=ei.get)
@@ -841,8 +718,6 @@ class Agent:
                 if ADAPT and not self.exploit and sum(len(b.get("obs", ())) for b in arms.values()) >= ADAPT_AFTER:
                     sa, sb = _joint(arms)  # масштаб по пилотам: оба на минимуме сетки = пилоты укладываются в шум вокруг истории
                     self.exploit = sa <= min(SCALE_GRID_A) and sb <= min(SCALE_GRID_B)
-                    # ненадёжна: постоянная часть масштаба ≥ 2× — пилоты сюрпризничают, история мало что говорит
-                    self.unreliable = sa >= 2
                     if not self.exploit:
                         self.scale = self._refit(arms)
                     self.log.append(f"adapt: scale a={sa}, b={sb} → {'история надёжна, ' + ADAPT_MODE if self.exploit else 'разведка'}")
@@ -869,7 +744,7 @@ class Agent:
             if not cand:
                 continue
             r, mu, lcb, sd, target = max(cand)
-            if lcb > 0 and (seg != "HIGH" or mu - LCB_K_HIGH * sd > 0):
+            if lcb > 0:
                 picks.append({"cur": cur, "seg": seg, "target": target, "mu": mu, "sd": sd, "lcb": lcb, "rank": r, **c})
 
         val = (lambda x: x["lcb"]) if CHANNEL_MU == "lcb" else (lambda x: x["mu"])
@@ -889,10 +764,8 @@ class Agent:
         return self._pack(chosen, net)
 
     def _eligible(self, a, k):
-        """Рукав может идти в план: есть история или пилот, LCB > 0 (и строже для HIGH при LCB_K_HIGH)."""
-        if not ("prior" in a.get("src", ("prior",)) or a["n"]):
-            return False
-        return _lcb(a) > 0 and (k[1] != "HIGH" or a["mu"] - LCB_K_HIGH * math.sqrt(a["var"]) > 0)
+        """Рукав может идти в план: есть история или пилот и LCB > 0."""
+        return ("prior" in a.get("src", ("prior",)) or a["n"]) and _lcb(a) > 0
 
     def _plan_milp(self, env, cells, arms, net):
         """
@@ -912,7 +785,7 @@ class Agent:
                  "rank": a["mu"], **c}
             if self._eligible(a, k):
                 names = ch
-            elif PUSH_FILL and a["mu"] - PUSH_K * math.sqrt(a["var"]) > 0:  # бесплатный канал: риск только в эффекте
+            elif PUSH_FILL and a["mu"] > 0:  # бесплатный канал: риск только в эффекте, ожидание > 0 окупается
                 names = free
             else:
                 continue
