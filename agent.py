@@ -64,6 +64,7 @@ SCALE_GRID_A = (0.5, 1.0, 2.0, 4.0, 8.0)
 SCALE_GRID_B = (0.25, 0.5, 1.0, 1.5, 2.0)
 PLANNER = "milp"            # "greedy": прежний жадный план; "milp": точный отбор ячеек/target/каналов под все лимиты (scipy), при сбое — greedy
 MILP_TIME = 20              # с на решатель
+PILOT_OVERLAP = True        # план учитывает, что абоненты пилотов уже получили эффект пилота: засчитывается лучший, прирост — только сверх него
 PUSH_FILL = True            # milp: ячейки с μ > 0, но LCB ≤ 0 могут идти в план бесплатным каналом
 ADAPT = True                # JOINT: после ADAPT_AFTER пилотов проверить, надёжна ли история, и сменить режим пилотов
 ADAPT_AFTER = 8
@@ -433,7 +434,7 @@ class Agent:
 
     def act(self, env):
         self.log, self.llm_audit, self.weights, self.share = [], [], {}, {}
-        self.exploit = False
+        self.exploit, self.piloted = False, {}
         self.deadline = time.time() + TIME_LIMIT
         arms = {}
         try:
@@ -712,6 +713,7 @@ class Agent:
             except (RuntimeError, ValueError):
                 break
             a, m = arms[k], res["n_customers"]
+            self.piloted.setdefault((cur, seg), []).append((target, m))
             obs = _update(a, res["observed_lift_ratio"] / mult, m, mult)
             if JOINT:
                 self.scale = self._refit(arms)
@@ -748,7 +750,18 @@ class Agent:
                 picks.append({"cur": cur, "seg": seg, "target": target, "mu": mu, "sd": sd, "lcb": lcb, "rank": r, **c})
 
         val = (lambda x: x["lcb"]) if CHANNEL_MU == "lcb" else (lambda x: x["mu"])
-        net = lambda x, c: val(x) * ch[c]["conversion_multiplier"] * x["S"] - ch[c]["cost_per_contact"] * x["n"]
+        pmult = ch[PILOT_CH]["conversion_multiplier"]
+
+        def net(x, c):
+            e = val(x) * ch[c]["conversion_multiplier"]
+            v = e * x["S"] - ch[c]["cost_per_contact"] * x["n"]
+            if PILOT_OVERLAP:  # дедупликация: абонент пилота даст max(e, e_пилота), т.е. сверх уже полученного — e − min(e, e_пилота)
+                # выборки пилотов независимы и пересекаются: абонент в лучшем из своих пилотов — идём от лучшего e_пилота
+                left = 1.0
+                for ep, m in sorted(((arms[(x["cur"], x["seg"], t)]["mu"] * pmult, m) for t, m in self.piloted.get((x["cur"], x["seg"]), ())), reverse=True):
+                    v -= left * m / x["n"] * x["S"] * min(e, ep)
+                    left *= 1 - m / x["n"]
+            return v
         chosen = None
         if PLANNER == "milp":
             try:
