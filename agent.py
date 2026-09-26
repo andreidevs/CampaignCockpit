@@ -23,6 +23,8 @@ import pandas as pd
 NOISE_STD = 0.804   # шум на абонента, опубликован в документации среды
 PRIOR_STD = 0.25    # широкий: в боевой среде эффекты другие, чем в истории
 ARMS_PER_CELL = 4
+LOOKAHEAD = False    # voi: выбор пилота rollout-симуляцией на LOOK_H шагов (см. _rollout_pick)
+LOOK_M, LOOK_R, LOOK_H = 6, 48, 3
 ARMS_BIG_FRAC = 0.10 # ячейка с долей ARPU ≥ порога получает все переходы из истории (0 = выключено)
 LCB_K = 0.5         # в план: mu - k*sigma > 0; 0 уходит в минус в пессимистичных мирах, 1 слишком робок
 EI_STOP = 0.005     # хватит разведки, когда EI < 0.5% от стартового максимума
@@ -667,6 +669,84 @@ class Agent:
         """Апостериор по ходу разведки: bma — усреднение по сетке масштабов; ml — масштаб 1 или подбор после каждого пилота."""
         return _joint(arms, fit=SCALE_MODE == "bma" or SCALE_AT == "each")
 
+    def _rollout_pick(self, env, cells, arms, ei, mult, cost):
+        """
+        Планирование на несколько шагов (rollout, Bertsekas; Powell «Optimal Learning», гл. 7): для LOOK_M лучших по
+        KG − цена кандидатов — LOOK_R миров θ ~ апостериор; в каждом: этот пилот (с шумом среды), затем LOOK_H − 1
+        пилотов по KG − цена, затем план (лучший тариф ячейки по μ, канал по прогнозу, жадно по ценности на контакт
+        в остатке охвата и бюджета), итог — реальная ценность плана в этом мире + выгода пилотов − их цена.
+        Миры и шум общие для всех кандидатов (common random numbers). Внутри — независимые гауссовы обновления.
+        """
+        cand = sorted((k for k, v in ei.items() if v > 0), key=lambda k: -ei[k])[:LOOK_M]
+        if len(cand) < 2:
+            return max(ei, key=ei.get)
+        keys = list(arms); pos = {k: i for i, k in enumerate(keys)}; K = len(keys)
+        cl = list(dict.fromkeys(k[:2] for k in keys)); cpos = {c: j for j, c in enumerate(cl)}
+        members = [[pos[k] for k in keys if k[:2] == c] for c in cl]
+        A = max(map(len, members))
+        P = np.array([mm + [K] * (A - len(mm)) for mm in members])  # K — пустой слот
+        ci = np.array([cpos[k[:2]] for k in keys]); slot = np.array([members[ci[i]].index(i) for i in range(K)])
+        Sk = np.array([cells[k[:2]]["S"] for k in keys]); nck = np.array([cells[k[:2]]["n"] for k in keys])
+        Sc = np.array([cells[c]["S"] for c in cl]); nc = np.array([cells[c]["n"] for c in cl])
+        chs = [(c["conversion_multiplier"], c["cost_per_contact"]) for c in env.channels.values()]
+        mu = np.array([arms[k]["mu"] for k in keys]); var = np.array([arms[k]["var"] for k in keys])
+        nk = np.array([self._pilot_size(cells, arms, k) for k in keys]); sig2 = (NOISE_STD / mult) ** 2 / nk
+        v_marg = mult * self._marginal_value(cells, arms, env.remaining_contacts)
+        rng = np.random.default_rng(7 + 31 * env.pilots_left)
+        R, H = LOOK_R, min(LOOK_H, env.pilots_left)
+        theta = rng.normal(mu, np.sqrt(var), size=(R, K)); Z = rng.normal(size=(R, H))
+        rows = np.arange(R)
+
+        def erf(x):  # Абрамовиц–Стиган 7.1.26, |ошибка| < 1.5e-7 — без scipy
+            t = 1 / (1 + 0.3275911 * np.abs(x))
+            y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * np.exp(-x * x)
+            return np.sign(x) * y
+
+        def cellwise(m):
+            cm = np.concatenate([m, np.full((R, 1), -np.inf)], 1)[:, P]
+            srt = np.sort(cm, 2)
+            return cm.argmax(2), srt[:, :, -1], (srt[:, :, -2] if A > 1 else np.full(srt.shape[:2], -np.inf))
+
+        def kgnet(m, v):
+            arg, t1, t2 = cellwise(m)
+            bo = np.maximum(np.where(arg[:, ci] == slot, t2[:, ci], t1[:, ci]), 0.0)
+            s = v / np.sqrt(v + sig2); z = -np.abs(m - bo) / s
+            f = z * 0.5 * (1 + erf(z / math.sqrt(2))) + np.exp(-z * z / 2) / math.sqrt(2 * math.pi)
+            return Sk * mult * s * f - nk * (cost + v_marg - mult * np.maximum(m, 0) * Sk / nck)
+
+        def plan_value(m, L, B):
+            arg, t1, _ = cellwise(m)
+            best_arm = P[np.arange(len(cl))[None, :], arg]  # (R, C)
+            pred = np.stack([t1 * mc * Sc - cc * nc for mc, cc in chs])  # (ch, R, C)
+            chi = pred.argmax(0); pv = pred.max(0)
+            ratio = np.where(pv > 0, pv / nc, -np.inf); order = np.argsort(-ratio, 1)
+            costs = np.array([cc for _, cc in chs])[chi] * nc
+            ok = (np.take_along_axis(ratio, order, 1) > -np.inf) \
+                & (np.cumsum(nc[order], 1) <= L[:, None]) & (np.cumsum(np.take_along_axis(costs, order, 1), 1) <= B[:, None])
+            real = theta[rows[:, None], np.minimum(best_arm, K - 1)] * np.array([mc for mc, _ in chs])[chi] * Sc - costs
+            return (np.take_along_axis(real, order, 1) * ok).sum(1)
+
+        best = None
+        for k0 in cand:
+            m, v = np.tile(mu, (R, 1)), np.tile(var, (R, 1))
+            L = np.full(R, float(env.remaining_contacts)); B = np.full(R, float(env.remaining_budget)); tot = np.zeros(R)
+            for h in range(H):
+                if h == 0:
+                    kidx, act = np.full(R, pos[k0]), np.ones(R, bool)
+                else:
+                    sc = kgnet(m, v); kidx = sc.argmax(1); act = sc[rows, kidx] > 0
+                n = nk[kidx]
+                obs = theta[rows, kidx] + Z[:, h] * np.sqrt(sig2[kidx])
+                tot += act * (theta[rows, kidx] * mult * Sk[kidx] / nck[kidx] * n - cost * n)
+                L -= act * n; B -= act * cost * n
+                vk = v[rows, kidx]; prec = 1 / vk + 1 / sig2[kidx]
+                m[rows, kidx] = np.where(act, (m[rows, kidx] / vk + obs / sig2[kidx]) / prec, m[rows, kidx])
+                v[rows, kidx] = np.where(act, 1 / prec, vk)
+            val = (tot + plan_value(m, L, B)).mean()
+            if best is None or val > best[0]:
+                best = (val, k0)
+        return best[1]
+
     def _explore(self, env, cells, arms):
         mult = env.channels[PILOT_CH]["conversion_multiplier"]
         cost = env.channels[PILOT_CH]["cost_per_contact"]
@@ -692,7 +772,8 @@ class Agent:
                       or abs(arms[k]["mu"] - self._best_other(arms, k)) / math.sqrt(arms[k]["var"]) <= 2}
                 if not ei:
                     break
-            k = max(ei, key=ei.get)
+            k = (self._rollout_pick(env, cells, arms, ei, mult, cost) if LOOKAHEAD and voi and not self.exploit and len(ei) > 1
+                 else max(ei, key=ei.get))
             ei0 = ei0 or ei[k]
             if not self.exploit and ((ei[k] <= 0) if voi else (ei[k] < EI_STOP * ei0)):
                 break
