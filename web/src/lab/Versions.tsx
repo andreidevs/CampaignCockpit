@@ -1,5 +1,5 @@
 import { Alert, Button, Card, Chip, Switch, ToggleButton, ToggleButtonGroup } from '@heroui/react'
-import { FlaskConical, GitBranch, Play, Rocket, SlidersHorizontal, Sparkles, Wand2 } from 'lucide-react'
+import { Bot, FileCode, FlaskConical, GitBranch, Play, Rocket, SlidersHorizontal, Sparkles, Wand2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import { lab, type Target, type Targets, type Test, type Version, type VersionStatus } from '../api'
@@ -7,9 +7,9 @@ import { DataTable, DiffLine, HowTo, Picker, Section, TestChip, Tip, VersionStat
 import { FAMILIES, worldNets, useVersion, type Family, type LabState } from './useLab'
 
 const STATUSES: VersionStatus[] = ['draft', 'evaluating', 'candidate', 'failed', 'promoted']
-export const WHO = { human: 'человек', template: 'шаблон', llm: 'LLM', system: 'система' } as const
+export const WHO = { human: 'человек', template: 'шаблон', llm: 'LLM', system: 'система', ai: 'AI-агент' } as const
 
-export default function Versions({ s }: { s: LabState }) {
+export default function Versions({ s, onAgent }: { s: LabState; onAgent: (id: string) => void }) {
   const [filter, setFilter] = useState<Set<VersionStatus>>(new Set(STATUSES))
   const v = s.selected
   return (
@@ -32,7 +32,7 @@ export default function Versions({ s }: { s: LabState }) {
           }>
           <Tree versions={s.versions} sel={v?.id} onSel={s.setSel} filter={filter} />
         </Section>
-        {v ? <StrategyCard v={v} s={s} /> : <Card className="p-5 text-sm text-muted">Версий пока нет</Card>}
+        {v ? <StrategyCard v={v} s={s} onAgent={onAgent} /> : <Card className="p-5 text-sm text-muted">Версий пока нет</Card>}
       </div>
       {v && <NewVersion parent={v} s={s} />}
     </>
@@ -61,7 +61,7 @@ function Tree({ versions, sel, onSel, filter }: { versions: Version[]; sel?: str
               <span className="num text-sm font-semibold">{v.id}</span>
               <VersionStatusChip s={v.status} />
               {v.current && <Rocket className="size-3.5 text-accent-soft-foreground" aria-label="сейчас в agent.py" />}
-              <span className="min-w-0 flex-1 truncate text-xs text-muted">{v.kind === 'baseline' ? 'baseline' : v.diff.map((d) => d.key).join(', ')}</span>
+              <span className="min-w-0 flex-1 truncate text-xs text-muted">{v.kind === 'baseline' ? 'baseline' : v.kind === 'ai' ? `AI: ${v.hypothesis}` : v.diff.map((d) => d.key).join(', ')}</span>
               <span className="num text-xs" title="медиана в жёстких мирах (keep 0)">{m == null ? '' : money(m)}</span>
             </button>
           </li>
@@ -71,10 +71,11 @@ function Tree({ versions, sel, onSel, filter }: { versions: Version[]; sel?: str
   )
 }
 
-function StrategyCard({ v, s }: { v: Version; s: LabState }) {
+function StrategyCard({ v, s, onAgent }: { v: Version; s: LabState; onAgent: (id: string) => void }) {
   const full = useVersion(v)
   const parent = useVersion(s.versions.find((x) => x.id === v.parent_id))
   const [steps, setSteps] = useState('1')
+  const [note, setNote] = useState<{ id: string; text: string }>()
   const [fam, setFam] = useState<Family>('harsh_0')
   const mine = worldNets(full, fam), theirs = worldNets(parent, fam)
   const delta = Object.keys(mine).map(Number).filter((k) => k in theirs).map((seed) => ({ seed, d: mine[seed] - theirs[seed] }))
@@ -88,7 +89,8 @@ function StrategyCard({ v, s }: { v: Version; s: LabState }) {
             <h3 className="num text-xl font-semibold">{v.id}</h3>
             <VersionStatusChip s={v.status} />
             {v.current && <Chip size="sm" color="success" variant="soft" className="gap-1"><Rocket className="size-3" aria-hidden />сейчас в agent.py</Chip>}
-            <Chip size="sm" variant="soft">{v.kind} · {WHO[v.created_by]}</Chip>
+            <Chip size="sm" variant="soft">{v.kind} · {WHO[v.created_by]}{v.ai ? ` · ${v.ai.harness}${v.ai.model ? `/${v.ai.model}` : ''}` : ''}{v.ai?.cost_usd ? ` · $${fmt(v.ai.cost_usd, 2)}` : ''}{v.ai?.run_id ? ` · ${v.ai.run_id}${v.ai.step ? ` шаг ${v.ai.step}` : ''}` : ''}</Chip>
+            {v.source_sha && <Tip tip="У версии свой код agent.py (правка AI-агента или её потомок)"><Chip size="sm" variant="soft" color="accent" className="num">code {v.source_sha}</Chip></Tip>}
           </div>
           <p className="text-sm">{v.hypothesis || '—'}</p>
           <p className="num text-xs text-muted">
@@ -105,18 +107,22 @@ function StrategyCard({ v, s }: { v: Version; s: LabState }) {
             selectedKeys={[steps]} onSelectionChange={(k) => setSteps(String([...k][0]))}>
             {['1', '2', '3'].map((x) => <Tip key={x} tip={`Шагов авто-исправления: ${x}. Каждый шаг — новая версия поверх предыдущей`}><ToggleButton id={x}>{x}</ToggleButton></Tip>)}
           </ToggleButtonGroup>
+          <Tip tip="Claude Code или Codex правят код agent.py этой версии — результат станет её дочерней версией">
+            <Button size="sm" variant="secondary" onPress={() => onAgent(v.id)}><Bot className="size-3.5" aria-hidden />AI-агент</Button>
+          </Tip>
           <Tip tip="Issues → ограниченный патч от LLM или шаблона → новая версия проходит матрицу и gate против родителя">
             <Button size="sm" variant="secondary" isDisabled={v.status === 'evaluating'} onPress={() => s.act(lab.remediate(v.id, Number(steps)))}>
               <Wand2 className="size-3.5" aria-hidden />Авто-исправить
             </Button>
           </Tip>
           <Tip tip={v.status === 'candidate' ? 'Записать настройки версии в agent.py и пересобрать submission.csv. Коммит — вручную' : 'Доступно только для candidate — версии, прошедшей gate'}>
-            <Button size="sm" variant="primary" isDisabled={v.status !== 'candidate'} onPress={() => s.act(lab.promote(v.id))}>
+            <Button size="sm" variant="primary" isDisabled={v.status !== 'candidate'} onPress={() => s.act(lab.promote(v.id).then((r) => r.needs_restart && setNote({ id: v.id, text: 'Код версии записан в agent.py. Перезапустите сервер — в этом процессе применились только константы.' })))}>
               <Rocket className="size-3.5" aria-hidden />Promote
             </Button>
           </Tip>
         </div>
       </div>
+      {note?.id === v.id && <Alert status="warning"><Alert.Content><Alert.Description>{note.text}</Alert.Description></Alert.Content></Alert>}
       {s.pending > 0 && <p className="text-xs text-muted">В очереди задач: {s.pending}. Матрица — около 10 секунд на версию.</p>}
 
       <div className="grid gap-4 md:grid-cols-3">
@@ -134,6 +140,7 @@ function StrategyCard({ v, s }: { v: Version; s: LabState }) {
           {v.gate.passed ? 'пройден' : v.gate.reasons.join('; ')}
         </div>
       )}
+      {(v.source_sha || v.parent_id) && <Code key={v.id} v={v} log={full?.ai?.log} />}
       {v.error && <pre className="num overflow-x-auto rounded-xl bg-default p-3 text-xs text-danger">{v.error}</pre>}
 
       {v.tests.length > 0 ? (
@@ -271,3 +278,33 @@ function NewVersion({ parent, s }: { parent: Version; s: LabState }) {
   )
 }
 const FIELD = 'h-9 rounded-lg border border-border bg-surface px-2.5 text-sm focus-visible:outline-2 focus-visible:outline-focus'
+
+// Исполняемый agent.py версии против родителя (код + константы); грузится по раскрытию
+function Code({ v, log }: { v: Version; log?: string }) {
+  const [diff, setDiff] = useState<string>()
+  const [openD, setOpenD] = useState(false)
+  useEffect(() => { if (openD && diff === undefined) lab.code(v.id).then((r) => setDiff(r.diff), (e) => setDiff(String(e))) }, [openD, diff, v.id])
+  return (
+    <div className="flex flex-col gap-2">
+      <details open={openD} onToggle={(e) => setOpenD(e.currentTarget.open)} className="rounded-xl border border-border">
+        <summary className="flex cursor-pointer items-center gap-2 px-4 py-2.5 text-sm font-medium">
+          <FileCode className="size-4" aria-hidden />Код agent.py: diff против {v.parent_id}
+        </summary>
+        {diff === undefined ? <p className="px-4 pb-3 text-sm text-muted">загрузка…</p>
+          : !diff ? <p className="px-4 pb-3 text-sm text-muted">код не отличается</p>
+          : <pre className="num max-h-[60vh] overflow-auto border-t border-border p-3 text-xs leading-relaxed">
+              {diff.split('\n').map((l, i) => (
+                <span key={i} className={`block ${l.startsWith('@@') ? 'text-accent-soft-foreground' : l.startsWith('+') ? 'bg-success/10 text-success'
+                  : l.startsWith('-') ? 'bg-danger/10 text-danger' : 'text-muted'}`}>{l || ' '}</span>
+              ))}
+            </pre>}
+      </details>
+      {log && (
+        <details className="rounded-xl border border-border">
+          <summary className="flex cursor-pointer items-center gap-2 px-4 py-2.5 text-sm font-medium"><Bot className="size-4" aria-hidden />Что делал AI-агент</summary>
+          <pre className="num max-h-[50vh] overflow-auto border-t border-border p-3 text-xs whitespace-pre-wrap">{log}</pre>
+        </details>
+      )}
+    </div>
+  )
+}

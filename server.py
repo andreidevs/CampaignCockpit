@@ -37,6 +37,7 @@ import auth  # noqa: E402
 import db  # noqa: E402
 import agent_template  # noqa: E402
 import datasets  # noqa: E402
+import harness  # noqa: E402
 import lab  # noqa: E402
 import stress_eval as se  # noqa: E402  (грузит profile / dict_tariff / history)
 from environment import make_environment  # noqa: E402
@@ -552,11 +553,13 @@ def api_feedback_run(seed: int = Query(42), world: str = Query("mock", pattern="
 
 # --- лаборатория версий (lab.py) ---------------------------------------------
 lab.ensure_baseline()
-_SLIM = ("runs", "audit")
+lab.ai_recover()
+_SLIM = ("runs", "audit", "source")
 
 
 def _slim(v, cur):
-    return {**{k: x for k, x in v.items() if k not in _SLIM}, "current": v["id"] == cur}
+    ai = v.get("ai") and {k: x for k, x in v["ai"].items() if k != "log"}  # лог агента — только в полной версии
+    return {**{k: x for k, x in v.items() if k not in _SLIM}, "ai": ai, "current": v["id"] == cur}
 
 
 @app.get("/api/lab/versions", dependencies=[Depends(ADMIN)], tags=["lab"], summary="Список версий")
@@ -625,6 +628,71 @@ def lab_promote(vid: str):
     run_payload.cache_clear()
     strategies_payload.cache_clear()
     return _slim(v, vid)
+
+
+@app.get("/api/lab/versions/{vid}/code", dependencies=[Depends(ADMIN)], tags=["lab"], summary="Код версии")
+def lab_code(vid: str):
+    """Unified diff исполняемого agent.py версии (код + константы) против родителя. 404, если нет версии."""
+    v = _load(vid)
+    return {"source_sha": v.get("source_sha"), "diff": lab.code_diff(vid)}
+
+
+@app.get("/api/lab/harnesses", dependencies=[Depends(ADMIN)], tags=["lab"], summary="Локальные AI-агенты")
+def lab_harnesses(refresh: bool = Query(False, description="перепроверить, не беря кеш на 60 с")):
+    """Claude Code и Codex на машине сервера: установлен ли CLI, версия, выполнен ли вход, модели."""
+    return {"harnesses": harness.status(refresh), "busy": lab.ai_busy()}
+
+
+class AiRunBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    parent_id: str = Field(pattern=r"^v\d{3,}$")
+    harness: Literal["claude", "codex"]
+    model: str = Field("", pattern=r"^[\w.:/-]{0,64}$")
+    task: str = Field(min_length=3, max_length=4000)
+    steps: int = Field(1, ge=1, le=10, description="шагов автономного цикла; 1 — одна правка")
+    budget_usd: float | None = Field(None, gt=0, le=100, description="стоп цикла, когда стоимость Claude дошла до суммы")
+
+
+def _run_slim(r):
+    return {k: x for k, x in r.items() if k != "events"}
+
+
+@app.post("/api/lab/ai/runs", tags=["lab"], summary="Запустить AI-агента")
+def lab_ai_start(body: AiRunBody, user: db.User = Depends(ADMIN)):
+    """Claude Code / Codex правят копию agent.py версии `parent_id` в песочнице, в фоне — не зависит от страницы.
+    Каждая правка — версия `kind=ai`, сразу проходит матрицу и gate. `steps` > 1 — автономный цикл: принятая версия
+    становится базой следующего шага, отклонённая — возвращается агенту с причинами. 409 — уже идёт запуск, 404 — нет версии."""
+    try:
+        r = lab.ai_start(body.parent_id, body.harness, body.model, body.task.strip(), user.email, body.steps, body.budget_usd)
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except FileNotFoundError:
+        raise HTTPException(404, f"нет версии {body.parent_id}")
+    return _run_slim(r)
+
+
+@app.get("/api/lab/ai/runs", dependencies=[Depends(ADMIN)], tags=["lab"], summary="Запуски AI-агента")
+def lab_ai_runs():
+    """Все запуски, новые первыми, без событий: статус, шаги, версии, принятые версии, стоимость и токены."""
+    return [_run_slim(r) for r in lab.runs()]
+
+
+@app.get("/api/lab/ai/runs/{rid}", dependencies=[Depends(ADMIN)], tags=["lab"], summary="Запуск и его события")
+def lab_ai_run(rid: str, after: int = Query(0, ge=0, description="вернуть события с номером больше этого")):
+    """Запуск и события с `i > after` — UI дочитывает лог по мере работы агента. 404 — нет запуска."""
+    try:
+        r = lab.run_load(rid)
+    except FileNotFoundError:
+        raise HTTPException(404, f"нет запуска {rid}")
+    return {**_run_slim(r), "events": [e for e in list(r["events"]) if e["i"] > after]}
+
+
+@app.post("/api/lab/ai/runs/{rid}/cancel", dependencies=[Depends(ADMIN)], tags=["lab"], summary="Остановить запуск")
+def lab_ai_cancel(rid: str):
+    """Убивает CLI со всеми дочерними процессами; уже созданные версии остаются. 409 — запуск не идёт."""
+    if not lab.ai_cancel(rid):
+        raise HTTPException(409, "запуск не идёт")
+    return {"cancelled": rid}
 
 
 @app.get("/api/lab/targets", dependencies=[Depends(ADMIN)], tags=["lab"], summary="Что можно править")

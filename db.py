@@ -60,6 +60,12 @@ class LabVersion(Base):  # версия — тот же dict, что раньш�
     data: Mapped[dict] = mapped_column(JSONB)
 
 
+class AiRun(Base):  # запуск AI-агента (lab.ai_start): задача, шаги, события, стоимость
+    __tablename__ = "ai_run"
+    id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    data: Mapped[dict] = mapped_column(JSONB)
+
+
 class LabAudit(Base):
     __tablename__ = "lab_audit"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

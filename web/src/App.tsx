@@ -1,6 +1,6 @@
 import { Alert, Button, Card, Chip, NumberField, Skeleton, Switch, ToggleButton, ToggleButtonGroup } from '@heroui/react'
 import {
-  BookOpen, Bug, Calculator, Coins, Database, FlaskConical, Gauge, GitBranch, GitCompare, History, Lightbulb, ListChecks, LoaderCircle, Megaphone, Play, Radar,
+  BookOpen, Bot, Bug, Calculator, Coins, Database, FlaskConical, Gauge, GitBranch, GitCompare, History, Lightbulb, ListChecks, LoaderCircle, Megaphone, Play, Radar,
   ScrollText, ShieldCheck, Swords, Users, UsersRound, Wrench, type LucideIcon,
 } from 'lucide-react'
 import { Fragment, useCallback, useEffect, useState } from 'react'
@@ -19,13 +19,14 @@ import Rules from './tabs/Rules'
 import Data from './tabs/Data'
 import { useLab, type LabState } from './lab/useLab'
 import Versions from './lab/Versions'
+import Agent from './lab/Agent'
 import Compare from './lab/Compare'
 import Runs from './lab/Runs'
 import Issues from './lab/Issues'
 import Fixes from './lab/Fixes'
 
 type TabId = 'command' | 'rules' | 'audience' | 'hypotheses' | 'pilots' | 'plan' | 'strategies' | 'privacy' | 'logs' | 'data' | 'docs'
-  | 'versions' | 'compare' | 'runs' | 'issues' | 'fixes'
+  | 'versions' | 'agent' | 'compare' | 'runs' | 'issues' | 'fixes'
 // step — место экрана в конвейере агента: аудитория → гипотезы → пилоты → план; lab — экраны лаборатории версий
 const TABS: {
   id: TabId; step?: number; lab?: boolean; label: string; sub: string; icon: LucideIcon
@@ -43,6 +44,7 @@ const TABS: {
   { id: 'data', label: 'Данные', sub: 'CSV и база знаний', icon: Database },
   { id: 'docs', label: 'Документация', sub: 'Как всё устроено', icon: BookOpen },
   { id: 'versions', lab: true, label: 'Версии', sub: 'Lineage и карточки', icon: GitBranch, labCount: (l) => l.versions.length },
+  { id: 'agent', lab: true, label: 'AI-агент', sub: 'Claude Code и Codex правят код', icon: Bot },
   { id: 'compare', lab: true, label: 'Сравнение', sub: '2–3 версии рядом', icon: GitCompare },
   { id: 'runs', lab: true, label: 'Прогоны', sub: 'Все запуски матрицы', icon: History },
   { id: 'issues', lab: true, label: 'Issues', sub: 'Проблемы версии', icon: Bug, labCount: (l) => l.selected?.issues.length ?? 0 },
@@ -72,6 +74,7 @@ export default function App({ user, onSignOut }: { user: User; onSignOut: () => 
   const current = tabs.find((t) => t.id === tab)!
   const standalone = tab === 'docs' || tab === 'data'  // экраны без прогона агента
   const labState = useLab(admin)
+  const openVersion = (id: string) => { labState.setSel(id); setTab('versions') }
 
   return (
     <div className="min-h-dvh bg-background lg:pl-64">
@@ -147,11 +150,12 @@ export default function App({ user, onSignOut }: { user: User; onSignOut: () => 
 
         {current.lab && (
           <div key={tab} className="rise flex flex-col gap-5">
-            {tab === 'versions' && <Versions s={labState} />}
+            {tab === 'versions' && <Versions s={labState} onAgent={(id) => { labState.setSel(id); setTab('agent') }} />}
+            {tab === 'agent' && <Agent s={labState} open={openVersion} />}
             {tab === 'compare' && <Compare s={labState} />}
             {tab === 'runs' && <Runs s={labState} />}
             {tab === 'issues' && <Issues s={labState} />}
-            {tab === 'fixes' && <Fixes s={labState} open={(id) => { labState.setSel(id); setTab('versions') }} />}
+            {tab === 'fixes' && <Fixes s={labState} open={openVersion} />}
           </div>
         )}
         {tab === 'docs' && <div className="rise"><Docs role={user.role} tabs={tabs} onOpen={(id) => setTab(id as TabId)} /></div>}

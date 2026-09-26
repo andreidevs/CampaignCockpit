@@ -100,7 +100,7 @@ export type LabRun = {
   log: string[]; campaigns?: LabCampaign[]; pilot_obs?: number[]
 }
 export type Version = {
-  id: string; parent_id: string | null; created_by: 'human' | 'template' | 'llm' | 'system'; kind: 'baseline' | 'manual' | 'auto'
+  id: string; parent_id: string | null; created_by: 'human' | 'template' | 'llm' | 'system' | 'ai'; kind: 'baseline' | 'manual' | 'auto' | 'ai'
   created_at: string; commit_hash: string | null; prompt_hash: string; config_hash: string
   config: Record<string, number | string | boolean>; diff: { key: string; from: unknown; to: unknown }[]
   status: VersionStatus; promoted: boolean; promoted_at: string | null; current: boolean; rejected_changes: string[]
@@ -108,7 +108,35 @@ export type Version = {
   tests: Test[]; metrics: Metrics | Record<string, never>; issues: Issue[]
   gate: { passed: boolean; reasons: string[]; vs: string | null } | null
   error?: string; evaluated_at?: string; runs?: LabRun[]; audit?: AuditRec[]
+  // AI-версия: свой код agent.py (source_sha) и что делал агент; log — только в полной версии
+  source_sha?: string | null; needs_restart?: boolean
+  ai?: {
+    harness: HarnessId; model: string | null; task: string; run_id?: string; step?: number
+    cost_usd?: number | null; tokens_in?: number; tokens_out?: number; log?: string
+  } | null
 }
+export type HarnessId = 'claude' | 'codex'
+export type Harness = {
+  id: HarnessId; title: string; models: string[]; login_cmd: string; install_cmd: string
+  installed: boolean; version: string | null; auth: 'ready' | 'login' | 'unknown' | 'missing' | 'broken'; ready: boolean
+}
+export type Brief = Record<'harsh0' | 'harsh50' | 'stress', { median: number | null; min: number | null }>
+export type AiEvent = { i: number; step: number } & (
+  | { kind: 'started'; parent: string; harness: HarnessId; model: string }
+  | { kind: 'text' | 'log' | 'step' | 'info' | 'rejected'; text: string }
+  | { kind: 'tool'; tool: string; detail: string }
+  | { kind: 'result'; ok: boolean; text: string; cost_usd: number | null; tokens_in: number; tokens_out: number }
+  | { kind: 'error'; message: string }
+  | { kind: 'evaluating'; version: string }
+  | { kind: 'evaluated'; version: string; status: VersionStatus; passed: boolean; reasons: string[]; metrics: Brief; base?: Brief }
+)
+export type AiRun = {
+  id: string; status: 'running' | 'done' | 'failed' | 'cancelled'; parent_id: string; harness: HarnessId; model: string | null
+  task: string; author: string; steps: number; budget_usd: number | null; step: number; created_at: string; finished_at: string | null
+  cost_usd: number; tokens_in: number; tokens_out: number; versions: string[]; accepted: string[]; best: string
+  error: string | null; note: string | null; summary?: string | null; n_events: number; events?: AiEvent[]
+}
+export type AiRunBody = { parent_id: string; harness: HarnessId; model: string; task: string; steps: number; budget_usd: number | null }
 export type Target = {
   type: 'float' | 'int' | 'bool' | 'choice' | 'str'; group: string; desc: string
   min?: number; max?: number; choices?: string[]; max_len?: number
@@ -132,6 +160,12 @@ export const lab = {
   evaluate: (id: string) => post(`/api/lab/versions/${id}/evaluate`),
   remediate: (id: string, steps = 1) => post(`/api/lab/versions/${id}/remediate?steps=${steps}`),
   promote: (id: string) => post<Version>(`/api/lab/versions/${id}/promote`),
+  code: (id: string) => get<{ source_sha: string | null; diff: string }>(`/api/lab/versions/${id}/code`),
+  harnesses: (refresh = false) => get<{ harnesses: Harness[]; busy: boolean }>(`/api/lab/harnesses${refresh ? '?refresh=true' : ''}`),
+  aiStart: (body: AiRunBody) => post<AiRun>('/api/lab/ai/runs', body),
+  aiRuns: () => get<AiRun[]>('/api/lab/ai/runs'),
+  aiRun: (id: string, after = 0) => get<AiRun>(`/api/lab/ai/runs/${id}?after=${after}`),
+  aiCancel: (id: string) => post(`/api/lab/ai/runs/${id}/cancel`),
 }
 
 // ---------- новые данные: CSV и база знаний (datasets.py) ----------
