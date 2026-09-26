@@ -50,6 +50,9 @@ PILOT_MAX = 200
 PILOT_SIZING = "adaptive"   # большой пилот только спорным рукавам, уверенные не перепроверяем; "fixed" — всем PILOT_FRAC
 PILOT_BUDGET_SHARE = 1.0    # доля бюджета, которую можно потратить на пилоты
 PILOT_CONTACT_SHARE = 1.0   # доля охвата, которую можно потратить на пилоты
+KG_CORR = False             # voi: коррелированный KG — пилот через общую модель (β) сдвигает все рукава, польза — по всему плану
+KG_OWN = "gain"             # "gain": пилоту засчитывается его выигрыш μ⁺; "loss": только ожидаемый ущерб μ⁻ (выигрыш дублирует финал)
+GH_N = 20                   # узлов Гаусса–Эрмита в ожидании KG
 PILOT_VALUE = "voi"         # "ei": expected improvement; "voi": knowledge gradient − цена пилота (с учётом выгоды самого пилота)
 LCB_K_PILOT = 0.5           # k для рукавов после пилота (у непилотированных остаётся LCB_K)
 PRIOR_SD = "share"          # "flat": PRIOR_STD всем; "share": sd рукава = √(SD0² + (SD_SHARE·доля перехода)²) вместо PRIOR_STD
@@ -355,7 +358,7 @@ def _update(a, obs, n, mult):
     return obs
 
 
-def _joint(arms, fit=True):
+def _joint(arms, fit=True, full=False):
     """
     Совместный апостериор всех рукавов (JOINT): θ_k = β0 + β1·m0_k + u_k, β ~ N([0, 1], diag(B0², B1²)),
     u_k ~ N(0, a²·v0a_k + b²·v0b_k). Пилот любого рукава сдвигает β, а через него — все рукава: если история
@@ -380,9 +383,10 @@ def _joint(arms, fit=True):
         return tau, S
 
     def post(sa, sb):
-        """Апостериор рукавов и log-правдоподобие пилотов при масштабе (sa, sb)."""
+        """Апостериор рукавов, log-правдоподобие пилотов и (при full) полная ковариация при масштабе (sa, sb)."""
         tau = sa ** 2 * va + sb ** 2 * vb
         mean, var, ll = m.copy(), (XS * X).sum(1) + tau, 0.0
+        C = XS @ X.T + np.diag(tau) if full else None
         if len(J):
             _, S = cov_obs(sa, sb)
             d = y - m[J]
@@ -390,7 +394,9 @@ def _joint(arms, fit=True):
             mean = m + CKJ @ np.linalg.solve(S, d)
             var = var - (CKJ * np.linalg.solve(S, CKJ.T).T).sum(1)
             ll = -0.5 * (d @ np.linalg.solve(S, d) + np.linalg.slogdet(S)[1])
-        return mean, var, ll
+            if full:
+                C = C - CKJ @ np.linalg.solve(S, CKJ.T)
+        return mean, var, ll, C
 
     grid = [(ga, gb) for ga in SCALE_GRID_A for gb in (SCALE_GRID_B if vb.any() else (1.0,))]
     if fit and SCALE_MODE == "bma":
@@ -401,15 +407,16 @@ def _joint(arms, fit=True):
         w = np.exp(lls - lls.max()); w /= w.sum()
         mean = sum(wi * r[0] for wi, r in zip(w, res)) if len(J) else m.copy()  # без пилотов μ = история, без шума float
         var = sum(wi * (r[1] + r[0] ** 2) for wi, r in zip(w, res)) - mean ** 2
+        C = sum(wi * (r[3] + np.outer(r[0], r[0])) for wi, r in zip(w, res)) - np.outer(mean, mean) if full else None
         sa, sb = grid[int(np.argmax(w))]
     else:
         sa, sb = 1.0, 1.0
         if fit and len(J) >= SCALE_MIN_OBS:  # ponytail: сетка 5×5 и полный перебор — q ≤ 20 наблюдений, это миллисекунды
             sa, sb = grid[int(np.argmax([post(ga, gb)[2] for ga, gb in grid]))]
-        mean, var, _ = post(sa, sb)
+        mean, var, _, C = post(sa, sb)
     for a, mu, v in zip(A, mean, var):
         a["mu"], a["var"] = float(mu), float(max(v, 1e-8))
-    return sa, sb
+    return (sa, sb, C) if full else (sa, sb)
 
 
 def _ei(mu, sd, best):
@@ -655,6 +662,8 @@ class Agent:
         Цена: SMS + вытесненные из плана контакты − выигрыш самого пилота (он тоже скорится).
         """
         v_marg = mult * self._marginal_value(cells, arms, env.remaining_contacts)
+        if KG_CORR and JOINT:
+            return self._arm_net_kg(env, cells, arms, mult, cost, v_marg)
         out = {}
         for k, a in arms.items():
             c, n = cells[k[:2]], self._pilot_size(cells, arms, k)
@@ -662,6 +671,30 @@ class Agent:
             kg = c["S"] * mult * _ei(-abs(a["mu"] - self._best_other(arms, k)), s, 0.0)
             out[k] = kg - n * (cost + v_marg - mult * max(a["mu"], 0.0) * c["S"] / c["n"])
         return out
+
+    def _arm_net_kg(self, env, cells, arms, mult, cost, v_marg):
+        """
+        Коррелированный KG (Frazier, Powell, Dayanik 2009): пилот рукава i сдвигает μ всех рукавов на
+        C[:, i] / sqrt(C_ii + шум) · z (общие β), польза — рост ожидаемой ценности плана «в каждой ячейке лучший
+        рукав SMS-кампанией или ничего». Ожидание по z — квадратура Гаусса–Эрмита.
+        """
+        keys = sorted(arms, key=lambda k: k[:2])
+        _, _, C = _joint({k: arms[k] for k in keys}, full=True)
+        mu = np.array([arms[k]["mu"] for k in keys])
+        S = np.array([cells[k[:2]]["S"] for k in keys])
+        nc = np.array([cells[k[:2]]["n"] for k in keys])
+        starts = np.flatnonzero([i == 0 or keys[i][:2] != keys[i - 1][:2] for i in range(len(keys))])
+
+        def value(M):
+            return np.clip(np.maximum.reduceat(M * mult * S - cost * nc, starts, axis=-1), 0.0, None).sum(-1)
+
+        n = np.array([self._pilot_size(cells, arms, k) for k in keys], dtype=float)
+        st = C / np.sqrt(np.diag(C) + (NOISE_STD / mult) ** 2 / n)[None, :]  # столбец i — сдвиг μ от пилота i на 1 z
+        z, pw = np.polynomial.hermite_e.hermegauss(GH_N)
+        kg = value(mu[None, None, :] + st.T[:, None, :] * z[None, :, None]) @ (pw / pw.sum()) - value(mu)
+        own = mult * mu * S / nc
+        own = np.maximum(own, 0.0) if KG_OWN == "gain" else np.minimum(own, 0.0)
+        return dict(zip(keys, kg - n * (cost + v_marg - own)))
 
     @staticmethod
     def _refit(arms):
