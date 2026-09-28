@@ -17,8 +17,9 @@ export default function Versions({ s, onAgent }: { s: LabState; onAgent: (id: st
       <HowTo>
         <b>Версия</b> — набор разрешённых настроек поверх <code>agent.py</code>: константы, флаги эвристик и дополнение к промпту.
         Каждая версия проходит одну и ту же <b>матрицу тестов</b>. Авто-патч получает статус <b>candidate</b>, только если прошёл gate
-        против родителя: must-have тесты пройдены, медиана в <b>жёстких мирах</b> (история бесполезна, как в боевой среде) не упала,
-        в стресс-мирах и мирах keep 0.5 упала не больше чем на 3%, худший из жёстких миров не стал хуже. <b>Promote</b> записывает
+        против родителя. Сравнение попарное, на тех же мирах: must-have тесты пройдены, в <b>жёстких мирах</b> (история бесполезна,
+        как в боевой среде) версия не хуже, в стресс-мирах и мирах keep 0.5 не хуже чем на 3%, и хотя бы в одном семействе
+        улучшение с уверенностью ≥ 90%. Миры gate — отложенные: AI-агент проверяет себя на других. <b>Promote</b> записывает
         настройки в <code>agent.py</code> и пересобирает <code>submission.csv</code>.
       </HowTo>
       {s.error && <Alert status="danger"><Alert.Content><Alert.Title>Лаборатория</Alert.Title><Alert.Description>{s.error}</Alert.Description></Alert.Content></Alert>}
@@ -138,6 +139,18 @@ function StrategyCard({ v, s, onAgent }: { v: Version; s: LabState; onAgent: (id
         <div className={`rounded-xl border px-4 py-3 text-sm ${v.gate.passed ? 'border-success/40' : 'border-danger/40'}`}>
           <b>Benchmark gate {v.gate.vs ? `против ${v.gate.vs}` : '(родитель не оценён — только must-have)'}:</b>{' '}
           {v.gate.passed ? 'пройден' : v.gate.reasons.join('; ')}
+          {v.gate.paired && (
+            <span className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+              {FAMILIES.filter((f) => v.gate?.paired?.[f.key]).map((f) => {
+                const p = v.gate!.paired![f.key]
+                return (
+                  <Tip key={f.key} tip={`Среднее изменение net на мир против родителя, 95% ДИ ${money(p.lo)} … ${money(p.hi)}, миров: ${p.n}`}>
+                    <span className="num">{f.label}: {p.delta > 0 ? '+' : ''}{money(p.delta)} · P(лучше) {fmt(100 * p.p_better)}%</span>
+                  </Tip>
+                )
+              })}
+            </span>
+          )}
         </div>
       )}
       {(v.source_sha || v.parent_id) && <Code key={v.id} v={v} log={full?.ai?.log} />}

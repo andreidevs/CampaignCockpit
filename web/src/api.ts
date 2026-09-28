@@ -99,6 +99,7 @@ export type LabRun = {
   crash: string | null; runtime: number; fallback: boolean; pilots: number; pilot_cost: number; total_contacts: number
   log: string[]; campaigns?: LabCampaign[]; pilot_obs?: number[]
 }
+export type Paired = { n: number; delta: number; lo: number; hi: number; p_better: number; p_worse: number }
 export type Version = {
   id: string; parent_id: string | null; created_by: 'human' | 'template' | 'llm' | 'system' | 'ai'; kind: 'baseline' | 'manual' | 'auto' | 'ai'
   created_at: string; commit_hash: string | null; prompt_hash: string; config_hash: string
@@ -106,7 +107,8 @@ export type Version = {
   status: VersionStatus; promoted: boolean; promoted_at: string | null; current: boolean; rejected_changes: string[]
   hypothesis: string; rationale: string; expected_benefit: string; issues_addressed: string[]; template: string | null
   tests: Test[]; metrics: Metrics | Record<string, never>; issues: Issue[]
-  gate: { passed: boolean; reasons: string[]; vs: string | null } | null
+  // paired: попарное сравнение с родителем по тем же мирам, семейство → Δ net на мир, 95% ДИ, P(лучше/хуже)
+  gate: { passed: boolean; reasons: string[]; vs: string | null; paired?: Record<string, Paired> | null } | null
   error?: string; evaluated_at?: string; runs?: LabRun[]; audit?: AuditRec[]
   // AI-версия: свой код agent.py (source_sha) и что делал агент; log — только в полной версии
   source_sha?: string | null; needs_restart?: boolean

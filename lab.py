@@ -39,12 +39,19 @@ from sqlalchemy.orm import Session
 import agent
 import db
 import harness
+import lab_check
 
 ROOT = Path(__file__).parent
 QUICK = os.environ.get("LAB_QUICK") == "1"
-SEEDS = list(range(2 if QUICK else 10))
-# главное семейство gate — больше миров: на 10 один мир около нуля решал исход «прогонов в минусе больше»
-PRIMARY_SEEDS = list(range(2 if QUICK else 30))
+# gate — на отложенных seed. AI-агент проверяет себя lab_check.py на DEV-seed и отложенных не видит:
+# иначе автономный цикл крутит agent.py, пока шум конкретных миров не пропустит правку.
+# ponytail: обратная связь агенту (медианы и причины gate) слегка «протекает» с отложенных seed; при долгих
+# циклах — ротировать HOLDOUT или подтверждать promote на свежих мирах.
+HOLDOUT = 7000  # stress_eval: world → rng 1000+seed, harsh_world → 2000+seed; 7000+ не пересекается с dev и большим стендом
+DEV_SEEDS = list(range(2 if QUICK else 10))
+DEV_PRIMARY_SEEDS = list(range(2 if QUICK else 30))  # главное семейство — больше миров: попарное сравнение точнее
+SEEDS = [HOLDOUT + s for s in DEV_SEEDS]
+PRIMARY_SEEDS = [HOLDOUT + s for s in DEV_PRIMARY_SEEDS]
 
 # --- разрешённые зоны изменений (они же policy engine) ---------------------
 PATCH_TARGETS = {
@@ -436,7 +443,7 @@ def _matrix(p, config):
         {"name": "stress_10", "title": f"stress_eval --runs {len(SEEDS)}", "passed": all(n > 0 for n in nets("stress_10")) and st.get("median", 0) > np.median(tmpl),
          "stats": st, "detail": f"все миры в плюс и медиана лучше шаблона ({np.median(tmpl) / 1e6:.2f}M)"},
         *[{"name": t, "title": f"{label} ({len(nets(t))})", "passed": all(n > 0 for n in nets(t)), "stats": _stats(nets(t)),
-           "detail": "все миры в плюс; в gate медиана " + ("не должна упасть" if key == PRIMARY else f"не должна упасть больше чем на {TH['gate_tol']:.0%}")}
+           "detail": "все миры в плюс; в gate попарно с родителем " + ("не хуже" if key == PRIMARY else f"не хуже чем на {TH['gate_tol']:.0%}")}
           for t, (key, label) in WORLDS.items() if t != "stress_10"],
         {"name": "schema", "title": "Валидация кампаний", "passed": all(valid(r) for r in runs),
          "stats": {"invalid": sum(r["invalid"] for r in runs), "crashes": sum(bool(r["crash"]) for r in runs)}, "detail": "1–10 кампаний, 0 отброшенных, без падений"},
@@ -592,9 +599,9 @@ REMEDIATION_INSTRUCTION = (
     "Ты инженер, который улучшает агента маркетинговых кампаний. В контексте: issues — найденные проблемы версии "
     "с доказательствами, metrics — сводные метрики тестов, targets — разрешённые настройки (текущее значение, границы), "
     "templates — готовые безопасные патчи. Выбери ОДНО небольшое изменение (1–2 настройки), которое скорее всего "
-    "исправит самую важную проблему. Главный критерий приёмки — медиана harsh0 (миры, где история бесполезна, "
-    "как в боевой среде) не должна упасть, худший мир harsh0 (harsh0_min) не должен стать хуже; stress и harsh50 — "
-    "не больше чем на 3%. Менять можно только ключи из targets. "
+    "исправит самую важную проблему. Критерий приёмки — попарно по тем же мирам с родителем: harsh0 (история "
+    "бесполезна, как в боевой среде) не хуже, stress и harsh50 не хуже чем на 3%, и хотя бы в одном семействе "
+    "уверенное улучшение (P ≥ 90%). Менять можно только ключи из targets. "
     'Ответ строго JSON: {"template": "id или null", "changes": {"KEY": value}, "hypothesis": "...", "expected_benefit": "..."}'
 )
 
@@ -645,26 +652,33 @@ def propose(parent):
 
 
 # --- gate / evaluate / remediate / promote ----------------------------------
+def _nets(runs):
+    """семейство → {seed: net}: попарное сравнение с родителем на тех же мирах."""
+    return {key: {r["seed"]: r["net"] for r in runs if r["test"] == test} for test, (key, _) in WORLDS.items()}
+
+
+def _same_worlds(v, parent):
+    a, b = _nets(v.get("runs") or []), _nets(parent.get("runs") or [])
+    return all(a[k] and a[k].keys() == b[k].keys() for k in a)
+
+
 def gate(v, parent):
+    """
+    must-have + попарное сравнение с родителем по мирам (lab_check.verdict): ни одно семейство не стало уверенно хуже
+    и хотя бы в одном — уверенное улучшение. Медианы двух выборок по 10–30 миров сравнивать нельзя: нейтральная правка
+    проходила «медиана не упала + худший мир не хуже» примерно в четверти случаев — монетка вместо gate.
+    """
     reasons = [f"must-have не пройден: {t['name']}" for t in v["tests"] if t["must"] and not t["passed"]]
-    m = v["metrics"]
-    if m["invalid"]:
-        reasons.append(f"отброшенных кампаний: {m['invalid']}")
-    if parent and parent.get("metrics"):
-        pm = parent["metrics"]
-        for key, label in WORLDS.values():
-            if key not in pm or key not in m:
-                reasons.append(f"нет результатов «{label}» у {'родителя' if key not in pm else 'версии'} — перепрогони матрицу")
-                continue
-            a, b = pm[key]["median"], m[key]["median"]
-            tol = 0.0 if key == PRIMARY else TH["gate_tol"]  # главное семейство — без допуска, остальные ±шум
-            if b < a - tol * abs(a):
-                reasons.append(f"медиана «{label}» упала: {_m(a)} → {_m(b)}" + (f" (допуск {tol:.0%})" if tol else ""))
-        # худший мир, а не число миров в минусе: счётчик на границе нуля — монетка
-        # (адаптивные пилоты: медиана +70%, худший мир −2.85M → −0.99M, но «в минусе» 1 → 2)
-        if PRIMARY in pm and PRIMARY in m and m[PRIMARY]["min"] < pm[PRIMARY]["min"]:
-            reasons.append(f"худший мир «{WORLDS_BY_KEY[PRIMARY]}» стал хуже: {_m(pm[PRIMARY]['min'])} → {_m(m[PRIMARY]['min'])}")
-    return {"passed": not reasons, "reasons": reasons, "vs": parent["id"] if parent and parent.get("metrics") else None}
+    if v["metrics"]["invalid"]:
+        reasons.append(f"отброшенных кампаний: {v['metrics']['invalid']}")
+    vs, stats = parent["id"] if parent and parent.get("runs") else None, None
+    if vs:
+        if not _same_worlds(v, parent):
+            reasons.append("миры родителя и версии не совпадают — перепрогони матрицу")
+        else:
+            r, stats = lab_check.verdict(_nets(v["runs"]), _nets(parent["runs"]), TH["gate_tol"])
+            reasons += r
+    return {"passed": not reasons, "reasons": reasons, "vs": vs, "paired": stats}
 
 
 def evaluate(vid):
@@ -679,8 +693,8 @@ def evaluate(vid):
         for r in v["runs"]:
             r.pop("audit")
         parent = load(v["parent_id"]) if v["parent_id"] else None
-        if parent and any(key not in parent.get("metrics", {}) for key, _ in WORLDS.values()):
-            parent = evaluate(parent["id"])  # родитель оценён старой матрицей — сравниваем на равных
+        if parent and not _same_worlds(v, parent):
+            parent = evaluate(parent["id"])  # родитель оценён старой матрицей или на других seed — сравниваем на равных
         v["gate"] = gate(v, parent)
         v["status"] = "promoted" if v["promoted"] else "candidate" if v["gate"]["passed"] else "failed"
     except Exception as e:
@@ -777,8 +791,10 @@ AI_RULES = """
 - Интерфейс не ломай: `Agent().act(env)` возвращает список кампаний; константы верхнего уровня (`LCB_K = ...` и т.д.)
   не удаляй и не переименовывай — лаборатория читает их из кода.
 - Проверка (зависимости уже стоят; разрешены только эти скрипты и `tail`/`head`/`grep`/`ls`/`cat`/`wc`):
-  - `python3 lab_check.py` — **локальный gate**: те же миры и seed, что у gate лаборатории, сравнение с родителем,
-    последняя строка — вердикт, ~10 с. **Обязателен перед тем, как закончить.**
+  - `python3 lab_check.py` — **локальный gate**: те же семейства миров и то же правило, что у gate лаборатории,
+    попарное сравнение с родителем, последняя строка — вердикт, ~10 с (+10 с на первом запуске). **Обязателен перед тем,
+    как закончить.** Gate лаборатории считает на других, отложенных seed: правка, подогнанная под миры lab_check,
+    там не пройдёт — улучшай стратегию, а не результат на конкретных seed.
   - для быстрых проб по ходу: `python3 stress_eval.py --keep 0 --runs 5 | tail -30` (harsh0), `python3 local_eval.py | tail -20`.
 - Заканчивай, только когда `lab_check.py` пишет «ПРОШЛА БЫ GATE». Не получилось за разумное число попыток — верни
   agent.py к исходнику (`agent_parent.py`) и опиши, что пробовал и почему не вышло: отклонённая правка стоит полный
@@ -1032,7 +1048,8 @@ def _task_md(parent, task):
         f"# Задача\n\n{task}\n",
         f"## Версия-родитель {parent['id']} ({parent['status']})\n\n"
         f"История, не задача: родитель уже содержит правку «{parent.get('hypothesis') or '—'}», повторять её не нужно.\n",
-        "Главный критерий приёмки (gate): медиана и худший мир harsh0 не хуже родителя; stress и harsh50 — не хуже чем на 3%;",
+        f"Главный критерий приёмки (gate), попарно с родителем по тем же мирам: harsh0 не хуже, stress и harsh50 — не хуже чем на "
+        f"{TH['gate_tol']:.0%}, и хотя бы в одном семействе улучшение с P ≥ {lab_check.GATE_P:.0%} (бутстреп разниц по мирам);",
         "must-have тесты: " + ", ".join(MUST) + ".\n",
         "## Метрики родителя (net в у.е.)\n\n```json\n" + json.dumps(brief, ensure_ascii=False, indent=1) + "\n```\n",
         "## Issues родителя\n\n" + ("\n".join(f"- {i['code']} ({i['severity']}): {i['evidence']}" for i in parent.get("issues", [])) or "нет") + "\n",
@@ -1062,11 +1079,10 @@ def _sandbox(parent, task):
     box = Path(tempfile.mkdtemp(prefix="cockpit-ai-"))
     (box / "agent.py").write_text(effective_source(parent))
     (box / "agent_parent.py").write_text(effective_source(parent))  # исходник: откатить, если правка не прошла lab_check
-    m = parent.get("metrics") or {}
+    # dev-seed, не отложенные; родителя lab_check прогонит сам из agent_parent.py — тоже без LLM, сравнение на равных
     (box / "lab_check.json").write_text(json.dumps({
-        "parent_id": parent["id"], "seeds": SEEDS, "primary_seeds": PRIMARY_SEEDS, "tol": TH["gate_tol"], "runtime": TH["runtime"],
-        "workers": WORKERS, "parent": {k: {x: m[k].get(x) for x in ("median", "min")} for k in ("harsh0", "harsh50", "stress") if k in m},
-        "note": "родитель оценён с LLM-экспертом, в песочнице LLM нет — сравнение приблизительное" if m.get("llm_used") else None}))
+        "parent_id": parent["id"], "seeds": DEV_SEEDS, "primary_seeds": DEV_PRIMARY_SEEDS, "tol": TH["gate_tol"],
+        "runtime": TH["runtime"], "workers": WORKERS}))
     for f in SANDBOX_FILES:
         if (ROOT / f).exists():
             shutil.copy(ROOT / f, box / f)
@@ -1106,22 +1122,26 @@ if __name__ == "__main__":
     codes = {i["code"] for i in detect([run(5e6), run(-1e6), run(6e6, fallback=True)])}
     assert {"HIGH_VARIANCE_BETWEEN_SEEDS", "TOO_MANY_NEGATIVE_PILOTS", "WEAK_LLM_CONTRIBUTION", "CALL_CHANNEL_NOT_COST_EFFECTIVE",
             "LOW_POSTERIOR_CONFIDENCE", "FALLBACK_TRIGGERED", "NO_DIVERSITY_IN_CAMPAIGNS"} <= codes, codes
-    # gate
+    # gate: попарно по мирам
     t_ok = [{"name": n, "must": True, "passed": True} for n in MUST]
-    mk = lambda h0, h50, st, lo=1.0: {"harsh0": {"median": h0, "min": lo}, "harsh50": {"median": h50}, "stress": {"median": st},  # noqa: E731
-                                      "invalid": 0}
-    base = {"id": "p", "metrics": mk(5.0, 6.0, 7.0)}
-    # в жёстких лучше, в стресс-мирах −2% (в пределах допуска) — проходит
-    assert gate({"tests": t_ok, "metrics": mk(5.5, 6.0, 6.86)}, base)["passed"]
-    # главное семейство без допуска: −1% в harsh0 — отказ
-    assert not gate({"tests": t_ok, "metrics": mk(4.95, 6.0, 7.0)}, base)["passed"]
-    g = gate({"tests": t_ok[:-1] + [{**t_ok[-1], "passed": False}], "metrics": mk(5.0, 6.0, 6.0, lo=0.5)}, base)
-    assert not g["passed"] and len(g["reasons"]) == 3, g
-    # lab_check (локальный gate агента) решает так же, как gate
-    import lab_check
-    for cand in (mk(5.5, 6.0, 6.86), mk(4.95, 6.0, 7.0), mk(5.0, 6.0, 6.0, lo=0.5), mk(5.0, 5.7, 7.0)):
-        assert bool(lab_check.verdict(cand, base["metrics"], TH["gate_tol"])) == (not gate({"tests": t_ok, "metrics": cand}, base)["passed"]), cand
-    assert "перепрогони" in gate({"tests": t_ok, "metrics": mk(5, 6, 7)}, {"id": "old", "metrics": {"stress": {"median": 7}, "negative_runs": 0}})["reasons"][0]
+    rng = np.random.default_rng(1)
+    base_nets = {k: rng.uniform(2e6, 8e6, n) for k, n in (("harsh_0", 30), ("harsh_50", 10), ("stress_10", 10))}
+
+    def ver(h0=1.0, h50=1.0, st=1.0, add=0.0, seeds=0):
+        f = {"harsh_0": h0, "harsh_50": h50, "stress_10": st}
+        runs = [{"test": k, "seed": seeds + s, "net": x * f[k] + (add if k == "harsh_0" else 0) + (rng.normal(0, 1e4) if f[k] != 1 else 0)}
+                for k, xs in base_nets.items() for s, x in enumerate(xs)]
+        return {"id": "x", "tests": t_ok, "metrics": {"invalid": 0}, "runs": runs}
+    base = ver()
+    assert gate(ver(h0=1.05, st=0.98), base)["passed"]  # harsh0 +5% в каждом мире, stress −2% (в допуске)
+    g = gate(ver(), base)
+    assert not g["passed"] and "не доказано" in g["reasons"][0], g  # нейтральная правка — шум, не прогресс
+    assert not gate(ver(h0=0.99, h50=1.2), base)["passed"]  # главное семейство без допуска: −1% везде — отказ
+    g = gate(ver(h0=1.05, st=0.9), base)
+    assert not g["passed"] and "стресс-миры" in g["reasons"][0] and g["paired"]["harsh0"]["p_better"] == 1, g
+    assert "не совпадают" in gate(ver(h0=1.05), ver(seeds=100))["reasons"][0]
+    g = gate({**ver(h0=1.05), "tests": t_ok[:-1] + [{**t_ok[-1], "passed": False}]}, base)
+    assert not g["passed"] and "must-have" in g["reasons"][0], g
     # быстрая матрица на baseline + один шаг ремедиации (без LLM)
     os.environ.pop("OPENAI_API_KEY", None)
     os.environ.pop("OPENROUTER_API_KEY", None)
@@ -1134,9 +1154,12 @@ if __name__ == "__main__":
     assert v1["status"] == "promoted" and all(t["passed"] for t in v1["tests"] if t["must"]), [(t["name"], t["passed"], t["detail"]) for t in v1["tests"]]
     # …и считает мир так же, как матрица: net совпадает до копейки
     for key, test in (("harsh0", "harsh_0"), ("stress", "stress_10")):
-        mine = lab_check.one((key, 0))[2]
-        assert mine == next(r["net"] for r in v1["runs"] if r["test"] == test and r["seed"] == 0), (key, mine)
-    assert "agent_parent.py" in os.listdir(box := _sandbox(v1, "t")) and json.loads((box / "lab_check.json").read_text())["parent"]["harsh0"]
+        mine = lab_check.one((key, SEEDS[0]))[2]
+        assert mine == next(r["net"] for r in v1["runs"] if r["test"] == test and r["seed"] == SEEDS[0]), (key, mine)
+    # песочница видит только dev-seed, отложенные seed gate ей не известны
+    assert "agent_parent.py" in os.listdir(box := _sandbox(v1, "t"))
+    cfg = json.loads((box / "lab_check.json").read_text())
+    assert cfg["seeds"] == DEV_SEEDS and not set(cfg["seeds"] + cfg["primary_seeds"]) & set(SEEDS + PRIMARY_SEEDS), cfg
     shutil.rmtree(box)
     made = remediate("v001", steps=1)
     v2 = load(made[0])
