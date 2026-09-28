@@ -378,7 +378,8 @@ def run_template(seed):
 
 # --- матрица тестов ---------------------------------------------------------
 _pool = None
-WORKERS = max(2, min(8, (os.cpu_count() or 2) - 1))
+# на хостинге cpu_count — ядра хоста, а не лимит контейнера: LAB_WORKERS, чтобы воркеры (~300 МБ каждый) влезли в RAM
+WORKERS = int(os.environ.get("LAB_WORKERS") or max(2, min(8, (os.cpu_count() or 2) - 1)))
 
 
 def pool():

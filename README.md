@@ -30,7 +30,7 @@ LLM_MODEL=openai/gpt-4o-mini
 ```
 
 ## Сборка и запуск UI (Campaign Cockpit)
-Пакет среды должен лежать в корне репо (шаг 1 быстрого старта): в образ он попадает из рабочей копии.
+Пакет среды должен лежать в корне репо (шаг 1 быстрого старта): в образ он попадает из рабочей копии. Если его там нет (сборка из клона на хостинге), Dockerfile скачивает его из релиза `participant-pkg`.
 
 **Docker — одной командой** (Postgres + API + собранный фронт на одном порту):
 ```bash
@@ -51,6 +51,12 @@ cd web && npm ci && npm run dev                   # http://localhost:5173, /api 
 cd web && npm ci && npm run build && cd ..        # tsc + vite build → web/dist
 AUTH_DEMO=1 uvicorn server:app --port 8000        # http://localhost:8000
 ```
+
+**Railway** (собирает `Dockerfile` из GitHub):
+1. В проекте: `+ New` → GitHub repo (этот) и `+ New` → Database → PostgreSQL.
+2. Сервис приложения → Variables: `DATABASE_URL=${{Postgres.DATABASE_URL}}`, `AUTH_SECRET` (длинная случайная строка), `AUTH_USERS=email:пароль:admin,...`, `AUTH_DEMO=0`; при RAM ≤ 1 ГБ — `LAB_WORKERS=2`; по желанию `OPENROUTER_API_KEY`.
+3. Settings → Networking → Generate Domain. Порт берётся из `PORT`, который задаёт Railway.
+4. Загрузки выгрузок переживают редеплой только на volume: сервис → Attach Volume, mount path `/app/uploads`.
 
 Swagger: http://localhost:8000/api/docs. Self-check'и и тесты — [docs/testing.md](docs/testing.md).
 

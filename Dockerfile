@@ -19,4 +19,5 @@ RUN for f in agent_template.py environment.py mock_environment.py scoring_core.p
       test -f "$f" || { echo "нет $f: положите пакет среды в корень репо (README, шаг 1); симлинки наружу в образ не попадают"; exit 1; }; done
 COPY --from=web /web/dist web/dist
 EXPOSE 8000
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+# хостинг задаёт порт через $PORT; в docker compose его нет — 8000
+CMD ["sh", "-c", "exec uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}"]

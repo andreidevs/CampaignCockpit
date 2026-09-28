@@ -19,8 +19,9 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 ROLES = ("manager", "analyst", "admin")
-URL = os.environ.get("DATABASE_URL", "postgresql://cockpit:cockpit@localhost:5432/cockpit").replace(
-    "postgresql://", "postgresql+psycopg://", 1)
+# хостинги отдают и postgres://, и postgresql:// — SQLAlchemy понимает только второе, драйвер — psycopg 3
+URL = re.sub(r"^postgres(ql)?://", "postgresql+psycopg://",
+             os.environ.get("DATABASE_URL", "postgresql://cockpit:cockpit@localhost:5432/cockpit"))
 SQLITE = URL.startswith("sqlite")  # десктоп-сборка: один файл, без схем
 ASYNC_URL = URL.replace("sqlite://", "sqlite+aiosqlite://", 1) if SQLITE else URL
 insert = (sqlite if SQLITE else postgresql).insert  # on_conflict_* у обоих диалектов одинаковый

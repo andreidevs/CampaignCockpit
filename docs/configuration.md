@@ -10,7 +10,8 @@
 | `OPENAI_BASE_URL` | агент | `https://api.openai.com/v1` | OpenAI-совместимый endpoint |
 | `OPENROUTER_API_KEY` | агент | — | если задан, LLM идёт через OpenRouter (приоритет над OpenAI) |
 | `LLM_MODEL` | агент | `openai/gpt-4o-mini` | модель OpenRouter |
-| `DATABASE_URL` | UI | `postgresql://cockpit:cockpit@localhost:5432/cockpit` | Postgres; `sqlite:///путь.db` — SQLite (так работает [десктоп](desktop.md)) |
+| `DATABASE_URL` | UI | `postgresql://cockpit:cockpit@localhost:5432/cockpit` | Postgres (`postgres://` тоже годится); `sqlite:///путь.db` — SQLite (так работает [десктоп](desktop.md)) |
+| `PORT` | UI в docker | `8000` | порт uvicorn в образе; хостинг (Railway) задаёт сам |
 | `DB_SCHEMA` | UI | `public` | схема БД (разводит стенды) |
 | `AUTH_USERS` | UI | — | `email:пароль:роль,...`, заводятся при пустой таблице |
 | `AUTH_DEMO` | UI | `1` в docker compose | `1` — без `AUTH_USERS` завести демо-пользователей; иначе сервер не стартует на пустой таблице |
@@ -18,6 +19,7 @@
 | `UPLOAD_DIR` | UI | `uploads/` | куда кладутся загруженные выгрузки (в docker — volume) |
 | `ENV_FILE` | UI | `.env` в корне репо | откуда `server.py` читает `.env` (десктоп — каталог данных приложения) |
 | `LAB_QUICK` | лаборатория | — | `1` — быстрая матрица тестов (для self-check) |
+| `LAB_WORKERS` | лаборатория | ядра − 1, от 2 до 8 | процессов матрицы, ~300 МБ каждый; на хостинге с малой RAM — `2` |
 
 ## Константы агента
 Флаги отброшенных экспериментов (`LCB_K_HIGH`, `PILOT_POS_ONLY`, `B2`, `PUSH_K`, `FLAT_PRIOR`, `SCALE_EXPLORE`, `SEED_BIG`, `TAIL_*`, `TARGET_SD`, `SEG_SD`, `CORR_KG`) удалены из кода; их замеры — в [experiments.md](experiments.md), код — в коммите `3554c1c` ветки `post-deadline`.
